@@ -13,15 +13,17 @@ import (
 
 	"github.com/shunshouda/mapstruct/generator"
 	parser2 "github.com/shunshouda/mapstruct/parser"
+	"golang.org/x/tools/go/packages"
 )
 
 var (
-	typeNames   = flag.String("type", "", "逗号分隔的结构体类型名称对，格式为:package.Source:package.Dest")
-	output      = flag.String("output", "", "输出文件名")
-	packageName = flag.String("package", "", "生成的包名")
-	includeDirs = flag.String("include", "", "逗号分隔的要包含的目录")
-	verbose     = flag.Bool("verbose", false, "显示详细日志")
-	modulePath  = flag.String("module", "", "Go Module 路径，如：github.com/user/project")
+	typeNames    = flag.String("type", "", "逗号分隔的结构体类型名称对，格式为:package.Source:package.Dest")
+	output       = flag.String("output", "", "输出文件名")
+	packageName  = flag.String("package", "", "生成的包名")
+	includeDirs  = flag.String("include", "", "逗号分隔的要包含的目录")
+	dependencies = flag.String("dependency", "", "逗号分隔的需要解析的依赖包路径")
+	verbose      = flag.Bool("verbose", false, "显示详细日志")
+	modulePath   = flag.String("module", "", "Go Module 路径，如：github.com/user/project")
 )
 
 func main() {
@@ -44,6 +46,9 @@ func main() {
 	// 获取要扫描的目录
 	scanDirs := getScanDirs(*includeDirs)
 
+	// 获取依赖包列表
+	deps := getDependencies(*dependencies)
+
 	// 自动检测 module path
 	if *modulePath == "" {
 		*modulePath = detectModulePath()
@@ -52,8 +57,8 @@ func main() {
 		log.Printf("检测到模块路径：%s", *modulePath)
 	}
 
-	// 收集所有结构体信息
-	structInfos := collectStructInfos(scanDirs, *modulePath)
+	// 收集所有结构体信息（包括依赖包）
+	structInfos := collectStructInfos(scanDirs, deps, *modulePath)
 
 	// 生成代码
 	gen := generator.NewGenerator(*packageName)
@@ -203,6 +208,19 @@ func getScanDirs(includeDirs string) []string {
 	return dirs
 }
 
+// 获取依赖包列表
+func getDependencies(deps string) []string {
+	if deps == "" {
+		return []string{}
+	}
+
+	depList := strings.Split(deps, ",")
+	for i, dep := range depList {
+		depList[i] = strings.TrimSpace(dep)
+	}
+	return depList
+}
+
 // 检测 Go Module 路径
 func detectModulePath() string {
 	// 查找当前目录或父目录中的 go.mod 文件
@@ -239,11 +257,11 @@ func detectModulePath() string {
 }
 
 // 收集所有目录的结构体信息
-func collectStructInfos(scanDirs []string, modulePath string) map[string]*parser2.StructInfo {
+func collectStructInfos(scanDirs []string, dependencies []string, modulePath string) map[string]*parser2.StructInfo {
 	structInfos := make(map[string]*parser2.StructInfo)
 	fset := token.NewFileSet()
 
-	// 第一遍：收集所有结构体基本信息（不解析嵌入字段和嵌套对象）
+	// 第一遍：收集本地目录的结构体基本信息（不解析嵌入字段和嵌套对象）
 	for _, dir := range scanDirs {
 		if *verbose {
 			log.Printf("扫描目录：%s", dir)
@@ -311,8 +329,18 @@ func collectStructInfos(scanDirs []string, modulePath string) map[string]*parser
 		}
 	}
 
-	// 第二遍：重新解析所有结构体，这次传入 allStructs 以解析嵌入字段和嵌套对象
+	// 第二遍：解析依赖包中的结构体
+	if len(dependencies) > 0 {
+		loadDependencyStructs(dependencies, structInfos, fset, *verbose)
+	}
+
+	// 第三遍：重新解析所有结构体，这次传入 allStructs 以解析嵌入字段和嵌套对象
 	for key, info := range structInfos {
+		// 如果是依赖包的结构体，跳过文件重新解析
+		if isDependencyStruct(info.ImportPath, modulePath) {
+			continue
+		}
+
 		// 重新读取文件并解析
 		for _, dir := range scanDirs {
 			pkgs, err := parser.ParseDir(fset, dir, nil, parser.ParseComments)
@@ -353,6 +381,88 @@ func collectStructInfos(scanDirs []string, modulePath string) map[string]*parser
 	}
 
 	return structInfos
+}
+
+// loadDependencyStructs 从依赖包中加载结构体信息
+func loadDependencyStructs(dependencies []string, structInfos map[string]*parser2.StructInfo, fset *token.FileSet, verbose bool) {
+	// 使用 go/packages 加载依赖包
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedSyntax,
+		Fset: fset,
+	}
+
+	for _, dep := range dependencies {
+		if verbose {
+			log.Printf("加载依赖包：%s", dep)
+		}
+
+		pkgs, err := packages.Load(cfg, dep)
+		if err != nil {
+			log.Printf("警告：加载依赖包 %s 失败：%v", dep, err)
+			continue
+		}
+
+		for _, pkg := range pkgs {
+			if verbose {
+				log.Printf("  解析包：%s", pkg.PkgPath)
+			}
+
+			for _, syntax := range pkg.Syntax {
+				filePkg := pkg.Name
+
+				// 计算依赖包的导入路径
+				importPath := pkg.PkgPath
+
+				ast.Inspect(syntax, func(n ast.Node) bool {
+					switch x := n.(type) {
+					case *ast.TypeSpec:
+						if structType, ok := x.Type.(*ast.StructType); ok {
+							structName := x.Name.Name
+
+							// 创建多个键来支持不同的查找方式
+							keys := []string{
+								fmt.Sprintf("%s.%s", filePkg, structName), // 包名。类型名
+								structName,                    // 仅类型名
+								importPath + "." + structName, // 导入路径。类型名
+							}
+
+							// 解析依赖包中的结构体
+							structInfo := parser2.ParseStruct(structName, structType, syntax, structInfos)
+							structInfo.Package = filePkg
+							structInfo.FilePath = pkg.GoFiles[0] // 使用第一个文件作为代表
+							structInfo.ImportPath = importPath
+
+							// 为每个键存储结构体信息
+							for _, key := range keys {
+								if existing, exists := structInfos[key]; exists {
+									if verbose {
+										log.Printf("    警告：键 %s 已存在 (%s)，覆盖为 %s",
+											key, existing.Package, filePkg)
+									}
+								}
+								structInfos[key] = structInfo
+							}
+
+							if verbose {
+								log.Printf("    找到依赖结构体：%s (包：%s, 导入路径：%s)", structName, filePkg, importPath)
+							}
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+}
+
+// isDependencyStruct 判断是否是依赖包的结构体
+func isDependencyStruct(importPath, modulePath string) bool {
+	if importPath == "" || modulePath == "" {
+		return false
+	}
+
+	// 如果导入路径不包含模块路径，说明是外部依赖
+	return !strings.HasPrefix(importPath, modulePath)
 }
 
 // countNestedObjects 统计嵌套对象数量（用于调试）

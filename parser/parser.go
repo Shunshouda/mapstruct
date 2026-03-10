@@ -200,12 +200,31 @@ func (s *StructInfo) findNestedStruct(fieldType string, file *ast.File, allStruc
 	// 解析包名和类型名
 	pkgName, bareTypeName := s.parseTypeWithPackage(typeName, file)
 
-	// 尝试多种键查找
+	// 尝试多种键查找，包括依赖包的路径
 	keys := []string{
 		typeName,                     // 完整类型名
 		bareTypeName,                 // 仅类型名
 		pkgName + "." + bareTypeName, // 包名。类型名
 		s.Package + "." + typeName,   // 当前包。类型名
+	}
+
+	// 如果有包名前缀，添加导入路径的键
+	if pkgName != "" && pkgName != s.Package {
+		// 尝试从导入中查找实际路径
+		if file != nil {
+			for _, imp := range file.Imports {
+				importPath := strings.Trim(imp.Path.Value, `"`)
+				parts := strings.Split(importPath, "/")
+				lastPart := parts[len(parts)-1]
+
+				// 匹配包名别名
+				if imp.Name != nil && imp.Name.Name == pkgName {
+					keys = append(keys, importPath+"."+bareTypeName)
+				} else if lastPart == pkgName {
+					keys = append(keys, importPath+"."+bareTypeName)
+				}
+			}
+		}
 	}
 
 	for _, key := range keys {

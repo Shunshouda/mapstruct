@@ -233,6 +233,21 @@ mapstruct \
   -package=transport \
   -output=./internal/transport/mappers.go \
   -module=github.com/your-company/your-project
+  
+mapstruct -type=github.com/pkg/errors.Error:local.MyError \
+          -dependency=github.com/pkg/errors \
+          -include=./local \
+          -output=mappers/generated.go
+
+mapstruct -type=time.Time:custom.Timestamp \
+          -include=./custom \
+          -output=mappers/time_mapper.go
+
+mapstruct -type=user.User:response.UserResponse,dto.OrderDTO:model.Order \
+          -dependency=github.com/some/module/dto,github.com/some/module/model \
+          -include=./user,./response \
+          -output=mappers/generated.go
+
 ```
 
 ## Project Structure

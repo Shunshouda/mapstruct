@@ -97,6 +97,18 @@ func (g *Generator) getImportAlias(pkgName, importPath string) string {
 		return pkgName
 	}
 
+	// 检查是否已有冲突的导入
+	for alias, path := range g.UsedPackages {
+		if alias == pkgName && path != importPath {
+			// 有冲突，使用导入路径的最后两部分作为别名
+			parts := strings.Split(importPath, "/")
+			if len(parts) >= 2 {
+				return parts[len(parts)-2] + "_" + parts[len(parts)-1]
+			}
+			return pkgName + "_ext"
+		}
+	}
+
 	// 否则，使用包名作为别名（避免冲突时可能需要处理）
 	return pkgName
 }
