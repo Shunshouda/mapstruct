@@ -11,4 +11,5 @@ type User struct {
 	CreatedAt time.Time `json:"created_at" mapstruct:"CreatedAt"`
 	Status    string    `json:"status"`
 	Tags      []string  `json:"tags"`
+	UU        *User     `json:"uu"`
 }

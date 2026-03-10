@@ -2,9 +2,10 @@ package generator
 
 import (
 	"fmt"
-	"github.com/shunshouda/mapstruct/parser"
 	"path/filepath"
 	"strings"
+
+	"github.com/shunshouda/mapstruct/parser"
 )
 
 // TypePair 类型对
@@ -33,18 +34,27 @@ type StructMapping struct {
 
 // Generator 代码生成器
 type Generator struct {
-	PackageName    string
-	StructMappings []StructMapping
-	UsedPackages   map[string]string // 包名 -> 导入路径
+	PackageName       string
+	StructMappings    []StructMapping
+	UsedPackages      map[string]string             // 包名 -> 导入路径
+	allStructs        map[string]*parser.StructInfo // 所有结构体信息，用于递归生成
+	generatedMappings map[string]bool               // 记录已生成的映射，避免重复
 }
 
 // NewGenerator 创建新的生成器
 func NewGenerator(packageName string) *Generator {
 	return &Generator{
-		PackageName:    packageName,
-		StructMappings: make([]StructMapping, 0),
-		UsedPackages:   make(map[string]string),
+		PackageName:       packageName,
+		StructMappings:    make([]StructMapping, 0),
+		UsedPackages:      make(map[string]string),
+		allStructs:        make(map[string]*parser.StructInfo),
+		generatedMappings: make(map[string]bool),
 	}
+}
+
+// SetAllStructs 设置所有结构体信息，用于递归生成嵌套映射
+func (g *Generator) SetAllStructs(allStructs map[string]*parser.StructInfo) {
+	g.allStructs = allStructs
 }
 
 // AddMapping 添加结构体映射
@@ -71,6 +81,12 @@ func (g *Generator) AddMapping(source, dest *parser.StructInfo) {
 	}
 
 	g.StructMappings = append(g.StructMappings, mapping)
+
+	// 标记此映射为已生成
+	mappingKey := fmt.Sprintf("%s.%s->%s.%s",
+		source.Package, source.Name,
+		dest.Package, dest.Name)
+	g.generatedMappings[mappingKey] = true
 }
 
 // getImportAlias 获取导入别名
@@ -100,7 +116,7 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 		}
 	}
 
-	// 2. 处理JSON名称映射
+	// 2. 处理 JSON 名称映射
 	for _, sourceField := range source.Fields {
 		if sourceField.JSONName == "" {
 			continue
@@ -188,13 +204,133 @@ func (g *Generator) Generate() (string, error) {
 		builder.WriteString(")\n\n")
 	}
 
-	// 生成每个映射函数
+	// 首先生成所有主映射函数（不生成嵌套映射的代码）
 	for _, mapping := range g.StructMappings {
 		builder.WriteString(g.generateMappingFunction(mapping))
 		builder.WriteString("\n\n")
 	}
 
+	// 然后生成所有需要的嵌套对象映射函数
+	g.generateNestedMappings(&builder)
+
 	return builder.String(), nil
+}
+
+// generateNestedMappings 生成所有嵌套对象的映射函数
+func (g *Generator) generateNestedMappings(builder *strings.Builder) {
+	// 收集所有需要生成的嵌套映射
+	toGenerate := make([]struct {
+		source *parser.StructInfo
+		dest   *parser.StructInfo
+	}, 0)
+
+	// 遍历所有已注册的映射，查找嵌套对象
+	for _, mapping := range g.StructMappings {
+		g.collectNestedMappings(mapping.Source, mapping.Dest, &toGenerate)
+	}
+
+	// 生成收集到的嵌套映射
+	for _, pair := range toGenerate {
+		mappingKey := fmt.Sprintf("%s.%s->%s.%s",
+			pair.source.Package, pair.source.Name,
+			pair.dest.Package, pair.dest.Name)
+
+		// 如果已经生成过，跳过
+		if g.generatedMappings[mappingKey] {
+			continue
+		}
+
+		// 创建新的映射
+		newMapping := StructMapping{
+			Source:      pair.source,
+			Dest:        pair.dest,
+			FieldMaps:   g.buildFieldMappings(pair.source, pair.dest),
+			MethodName:  fmt.Sprintf("%sTo%s", pair.source.Name, pair.dest.Name),
+			NeedImports: make(map[string]string),
+		}
+
+		// 记录需要导入的包
+		if pair.source.Package != g.PackageName && pair.source.ImportPath != "" {
+			importAlias := g.getImportAlias(pair.source.Package, pair.source.ImportPath)
+			newMapping.NeedImports[importAlias] = pair.source.ImportPath
+			g.UsedPackages[importAlias] = pair.source.ImportPath
+		}
+
+		if pair.dest.Package != g.PackageName && pair.dest.ImportPath != "" {
+			importAlias := g.getImportAlias(pair.dest.Package, pair.dest.ImportPath)
+			newMapping.NeedImports[importAlias] = pair.dest.ImportPath
+			g.UsedPackages[importAlias] = pair.dest.ImportPath
+		}
+
+		// 生成映射函数
+		builder.WriteString(g.generateMappingFunction(newMapping))
+		builder.WriteString("\n\n")
+
+		// 标记为已生成
+		g.generatedMappings[mappingKey] = true
+
+		// 递归处理这个嵌套映射的子嵌套对象
+		g.collectNestedMappings(pair.source, pair.dest, &toGenerate)
+	}
+}
+
+// collectNestedMappings 收集嵌套对象的映射对
+func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGenerate *[]struct {
+	source *parser.StructInfo
+	dest   *parser.StructInfo
+}) {
+	// 遍历源结构体的所有字段
+	for _, sourceField := range source.Fields {
+		// 如果不是嵌套对象，跳过
+		if !sourceField.IsNestedObject || sourceField.NestedStructInfo == nil {
+			continue
+		}
+
+		// 在目标结构体中查找对应的字段
+		destField := dest.GetFieldByName(sourceField.Name)
+		if destField == nil {
+			// 尝试通过 JSON 标签查找
+			if sourceField.JSONName != "" {
+				destField = dest.GetFieldByJSONName(sourceField.JSONName)
+			}
+		}
+
+		if destField == nil || !destField.IsNestedObject || destField.NestedStructInfo == nil {
+			continue
+		}
+
+		// 找到一对嵌套对象
+		nestedSource := sourceField.NestedStructInfo
+		nestedDest := destField.NestedStructInfo
+
+		if nestedSource != nil && nestedDest != nil {
+			// 检查是否已经存在或计划生成
+			mappingKey := fmt.Sprintf("%s.%s->%s.%s",
+				nestedSource.Package, nestedSource.Name,
+				nestedDest.Package, nestedDest.Name)
+
+			alreadyExists := false
+			for _, pair := range *toGenerate {
+				if pair.source.Name == nestedSource.Name &&
+					pair.dest.Name == nestedDest.Name &&
+					pair.source.Package == nestedSource.Package &&
+					pair.dest.Package == nestedDest.Package {
+					alreadyExists = true
+					break
+				}
+			}
+
+			if !alreadyExists && !g.generatedMappings[mappingKey] {
+				*toGenerate = append(*toGenerate, struct {
+					source *parser.StructInfo
+					dest   *parser.StructInfo
+				}{
+					source: nestedSource,
+					dest:   nestedDest,
+				})
+			}
+		}
+	}
 }
 
 // generateMappingFunction 生成单个映射函数
@@ -257,8 +393,45 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 	sourceType := fieldMap.SourceField.Type
 	destType := fieldMap.DestField.Type
 
-	sourceFieldRef := fmt.Sprintf("src.%s", fieldMap.SourceField.Name)
-	destFieldRef := fmt.Sprintf("dst.%s", fieldMap.DestField.Name)
+	// 构建源字段访问路径
+	var sourceFieldPath []string
+	if len(fieldMap.SourceField.EmbeddedPath) > 0 {
+		sourceFieldPath = append(sourceFieldPath, fieldMap.SourceField.EmbeddedPath...)
+	}
+	sourceFieldPath = append(sourceFieldPath, fieldMap.SourceField.Name)
+	sourceFieldRef := "src." + strings.Join(sourceFieldPath, ".")
+
+	// 构建目标字段访问路径
+	var destFieldPath []string
+	if len(fieldMap.DestField.EmbeddedPath) > 0 {
+		destFieldPath = append(destFieldPath, fieldMap.DestField.EmbeddedPath...)
+	}
+	destFieldPath = append(destFieldPath, fieldMap.DestField.Name)
+	destFieldRef := "dst." + strings.Join(destFieldPath, ".")
+
+	// 如果是嵌套对象，生成递归调用
+	if fieldMap.SourceField.IsNestedObject && fieldMap.DestField.IsNestedObject {
+		methodName := fmt.Sprintf("%sTo%s",
+			fieldMap.SourceField.NestedStructInfo.Name,
+			fieldMap.DestField.NestedStructInfo.Name)
+
+		// 处理指针类型
+		if strings.HasPrefix(sourceType, "*") && strings.HasPrefix(destType, "*") {
+			return fmt.Sprintf("%s = %s(%s)", destFieldRef, methodName, sourceFieldRef)
+		}
+
+		if strings.HasPrefix(sourceType, "*") && !strings.HasPrefix(destType, "*") {
+			return fmt.Sprintf("if %s != nil {\n\t\ttmp := %s(%s)\n\t\tif tmp != nil {\n\t\t\t%s = *tmp\n\t\t}\n\t}",
+				sourceFieldRef, methodName, sourceFieldRef, destFieldRef)
+		}
+
+		if !strings.HasPrefix(sourceType, "*") && strings.HasPrefix(destType, "*") {
+			return fmt.Sprintf("%s = %s(&%s)", destFieldRef, methodName, sourceFieldRef)
+		}
+
+		// 都是值类型
+		return fmt.Sprintf("%s = %s(%s)", destFieldRef, methodName, sourceFieldRef)
+	}
 
 	// 类型完全匹配
 	if sourceType == destType {

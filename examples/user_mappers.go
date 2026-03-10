@@ -38,11 +38,14 @@ func UserToUserResponse(src *user.User) *response.UserResponse {
 
 	dst := &response.UserResponse{}
 
-	dst.ID = src.ID
-	dst.Name = src.Name
+	dst.UserDTO.ID = src.ID
+	dst.UserDTO.Name = src.Name
 	dst.Email = src.Email
-	dst.Age = src.Age
-	dst.Status = src.Status
+	dst.UserDTO.Age = int32(src.Age)
+	dst.UserDTO.Status = src.Status
+	dst.UserDTO.Tags = src.Tags
+	dst.UU = UserToUserResponse(src.UU)
+	dst.UserDTO.CreatedAt = src.CreatedAt.Format("2006-01-02 15:04:05")
 
 	return dst
 }
