@@ -441,8 +441,8 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 			return fmt.Sprintf("%s = %s(&%s)", destFieldRef, methodName, sourceFieldRef)
 		}
 
-		// 都是值类型
-		return fmt.Sprintf("%s = %s(%s)", destFieldRef, methodName, sourceFieldRef)
+		// 都是值类型 - 辅助方法返回指针，需要解引用以匹配值类型字段
+		return fmt.Sprintf("%s = *%s(&%s)", destFieldRef, methodName, sourceFieldRef)
 	}
 
 	// 类型完全匹配
