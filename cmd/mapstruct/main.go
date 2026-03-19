@@ -129,6 +129,12 @@ func handleMapConversion(gen *generator.Generator, pair generator.TypePair, stru
 		var structInfo *parser2.StructInfo
 		var exists bool
 
+		// 如果 DestType 为空，说明配置无效
+		if pair.DestType == "" {
+			log.Printf("警告：无效的 map 转换配置，目标结构体类型为空")
+			return
+		}
+
 		keys := []string{
 			fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType),
 			pair.DestType,
@@ -143,7 +149,7 @@ func handleMapConversion(gen *generator.Generator, pair generator.TypePair, stru
 		}
 
 		if !exists {
-			log.Printf("警告：未找到目标结构体 %s", pair.DestType)
+			log.Printf("警告：未找到目标结构体 %s (尝试的键：%v)", pair.DestType, keys)
 			return
 		}
 
@@ -253,7 +259,7 @@ func parseStructToMap(sourcePart, destPart string) generator.TypePair {
 	sourceParts := strings.Split(sourcePart, ".")
 	mapValueType := "any"
 
-	// 解析 map 值类型
+	// 解析 map 值类型，支持 map[string]any 和 map[string]interface{}
 	if strings.HasPrefix(destPart, "map[string]") {
 		mapValueType = strings.TrimPrefix(destPart, "map[string]")
 		if mapValueType == "" {
@@ -282,7 +288,7 @@ func parseMapToStruct(sourcePart, destPart string) generator.TypePair {
 	destParts := strings.Split(destPart, ".")
 	mapValueType := "any"
 
-	// 解析 map 值类型
+	// 解析 map 值类型，支持 map[string]any 和 map[string]interface{}
 	if strings.HasPrefix(sourcePart, "map[string]") {
 		mapValueType = strings.TrimPrefix(sourcePart, "map[string]")
 		if mapValueType == "" {
@@ -294,6 +300,13 @@ func parseMapToStruct(sourcePart, destPart string) generator.TypePair {
 		IsMapConversion: true,
 		Direction:       "from-map",
 		MapValueType:    mapValueType,
+	}
+
+	// 检查 destPart 是否是有效的结构体类型（不是 map 类型）
+	if isMapType(destPart) {
+		// 如果目标也是 map 类型，这是无效的配置
+		pair.DestType = ""
+		return pair
 	}
 
 	if len(destParts) == 2 {
