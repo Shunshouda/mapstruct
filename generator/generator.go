@@ -291,6 +291,15 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 	source *parser.StructInfo
 	dest   *parser.StructInfo
 }) {
+	// 使用 map 来避免重复检查，O(1) 复杂度
+	existingMap := make(map[string]bool, len(*toGenerate))
+	for _, pair := range *toGenerate {
+		key := fmt.Sprintf("%s.%s->%s.%s",
+			pair.source.Package, pair.source.Name,
+			pair.dest.Package, pair.dest.Name)
+		existingMap[key] = true
+	}
+
 	// 遍历源结构体的所有字段
 	for _, sourceField := range source.Fields {
 		// 如果不是嵌套对象，跳过
@@ -316,31 +325,22 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 		nestedDest := destField.NestedStructInfo
 
 		if nestedSource != nil && nestedDest != nil {
-			// 检查是否已经存在或计划生成
 			mappingKey := fmt.Sprintf("%s.%s->%s.%s",
 				nestedSource.Package, nestedSource.Name,
 				nestedDest.Package, nestedDest.Name)
 
-			alreadyExists := false
-			for _, pair := range *toGenerate {
-				if pair.source.Name == nestedSource.Name &&
-					pair.dest.Name == nestedDest.Name &&
-					pair.source.Package == nestedSource.Package &&
-					pair.dest.Package == nestedDest.Package {
-					alreadyExists = true
-					break
-				}
+			if existingMap[mappingKey] || g.generatedMappings[mappingKey] {
+				continue
 			}
 
-			if !alreadyExists && !g.generatedMappings[mappingKey] {
-				*toGenerate = append(*toGenerate, struct {
-					source *parser.StructInfo
-					dest   *parser.StructInfo
-				}{
-					source: nestedSource,
-					dest:   nestedDest,
-				})
-			}
+			*toGenerate = append(*toGenerate, struct {
+				source *parser.StructInfo
+				dest   *parser.StructInfo
+			}{
+				source: nestedSource,
+				dest:   nestedDest,
+			})
+			existingMap[mappingKey] = true
 		}
 	}
 }

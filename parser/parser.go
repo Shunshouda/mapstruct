@@ -33,6 +33,10 @@ type StructInfo struct {
 	Fields     []FieldInfo
 	// EmbeddedTypes 记录嵌入的类型
 	EmbeddedTypes []EmbeddedType
+
+	// 缓存字段查找，提升性能
+	fieldByNameMap     map[string]*FieldInfo
+	fieldByJSONNameMap map[string]*FieldInfo
 }
 
 // EmbeddedType 嵌入类型信息
@@ -318,24 +322,31 @@ func parseJSONTag(tag string) string {
 	return parts[0]
 }
 
-// GetFieldByName 根据名称查找字段
+// GetFieldByName 根据名称查找字段（使用缓存的 Map，O(1) 复杂度）
 func (s *StructInfo) GetFieldByName(name string) *FieldInfo {
-	for _, field := range s.Fields {
-		if field.Name == name {
-			return &field
+	if s.fieldByNameMap == nil {
+		s.fieldByNameMap = make(map[string]*FieldInfo, len(s.Fields))
+		for i := range s.Fields {
+			s.fieldByNameMap[s.Fields[i].Name] = &s.Fields[i]
 		}
 	}
-	return nil
+	return s.fieldByNameMap[name]
 }
 
-// GetFieldByJSONName 根据 JSON 名称查找字段
+// GetFieldByJSONName 根据 JSON 名称查找字段（使用缓存的 Map，O(1) 复杂度）
 func (s *StructInfo) GetFieldByJSONName(jsonName string) *FieldInfo {
-	for _, field := range s.Fields {
-		if field.JSONName == jsonName {
-			return &field
+	if jsonName == "" {
+		return nil
+	}
+	if s.fieldByJSONNameMap == nil {
+		s.fieldByJSONNameMap = make(map[string]*FieldInfo, len(s.Fields))
+		for i := range s.Fields {
+			if s.Fields[i].JSONName != "" {
+				s.fieldByJSONNameMap[s.Fields[i].JSONName] = &s.Fields[i]
+			}
 		}
 	}
-	return nil
+	return s.fieldByJSONNameMap[jsonName]
 }
 
 // GetMapStructField 根据 mapstruct 标签查找映射字段

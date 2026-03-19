@@ -261,10 +261,18 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 	structInfos := make(map[string]*parser2.StructInfo)
 	fset := token.NewFileSet()
 
+	// 缓存已解析的目录，避免重复解析
+	parsedDirs := make(map[string]map[string]*ast.Package)
+
 	// 第一遍：收集本地目录的结构体基本信息（不解析嵌入字段和嵌套对象）
 	for _, dir := range scanDirs {
 		if *verbose {
 			log.Printf("扫描目录：%s", dir)
+		}
+
+		// 检查缓存
+		if _, exists := parsedDirs[dir]; exists {
+			continue
 		}
 
 		// 解析目录下的所有 Go 文件
@@ -273,6 +281,7 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 			log.Printf("警告：解析目录 %s 失败：%v", dir, err)
 			continue
 		}
+		parsedDirs[dir] = pkgs
 
 		for pkgName, pkg := range pkgs {
 			for fileName, file := range pkg.Files {
@@ -335,16 +344,17 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 	}
 
 	// 第三遍：重新解析所有结构体，这次传入 allStructs 以解析嵌入字段和嵌套对象
+	// 优化：使用缓存的解析结果，避免重新读取文件
 	for key, info := range structInfos {
 		// 如果是依赖包的结构体，跳过文件重新解析
 		if isDependencyStruct(info.ImportPath, modulePath) {
 			continue
 		}
 
-		// 重新读取文件并解析
+		// 从缓存的解析结果中查找文件
 		for _, dir := range scanDirs {
-			pkgs, err := parser.ParseDir(fset, dir, nil, parser.ParseComments)
-			if err != nil {
+			pkgs, exists := parsedDirs[dir]
+			if !exists {
 				continue
 			}
 
