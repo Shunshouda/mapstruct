@@ -2,7 +2,18 @@
 
 # Go MapStruct
 
-A powerful code generation tool for Go that automatically generates type-safe mapping functions between structs, inspired by Java MapStruct.
+A powerful code generation tool for Go that automatically generates type-safe mapping functions between structs and maps, inspired by Java MapStruct.
+
+## What is MapStruct?
+
+MapStruct is a code generator that simplifies the mapping between different struct types in Go. It eliminates the need for writing repetitive boilerplate code, while providing type-safe and efficient mappings.
+
+### Key Benefits
+- **Eliminates boilerplate code** for struct-to-struct and struct-to-map conversions
+- **Type-safe** at compile time, catching errors early
+- **Zero runtime overhead** with generated pure Go code
+- **Flexible** with multiple mapping strategies
+- **Extensible** with custom type conversions
 
 ## Features
 
@@ -10,6 +21,8 @@ A powerful code generation tool for Go that automatically generates type-safe ma
 - 🔒 **Type Safety**: Compile-time checked mappings
 - 🔄 **Automatic Field Mapping**: Maps fields by name, JSON tags, or custom tags
 - 📦 **Cross-Package Support**: Map between structs in different packages
+- 📚 **Dependency Package Support**: Parse and map structs from external dependencies
+- 🗺️ **Struct-Map Conversion**: Bidirectional conversion between structs and maps
 - ⚡ **Custom Type Conversion**: Built-in support for common type conversions
 - 🎯 **Flexible Configuration**: Multiple mapping strategies and customizations
 - 🔍 **Comprehensive Debugging**: Verbose and debug modes for troubleshooting
@@ -138,8 +151,7 @@ mapstruct \
   -include=./internal/user,./internal/dto \
   -package=mappers \
   -output=./mappers/generated.go \
-  -verbose \
-  -debug
+  -verbose
 ```
 
 ## Command Line Options
@@ -151,8 +163,10 @@ mapstruct \
 | `-package` | Package name for generated code | Auto-detected |
 | `-output` | Output file name | `generated_mapstruct.go` |
 | `-module` | Go module path | Auto-detected from go.mod |
+| `-dependency` | Comma-separated dependency package paths | Empty |
 | `-verbose` | Enable verbose logging | `false` |
-| `-debug` | Enable debug output | `false` |
+| `-map-direction` | Map conversion direction: `to-map`, `from-map`, `both` | `both` |
+| `-map-value-type` | Map value type: `any`, `interface{}` | `any` |
 
 ## Mapping Strategies
 
@@ -213,6 +227,81 @@ func customUserToDTO(user *user.User) *dto.UserDTO {
 }
 ```
 
+## Struct-Map Conversion
+
+### Struct to Map
+
+Generate functions to convert structs to maps:
+
+```bash
+mapstruct -type=user.User:map -map-direction=to-map
+```
+
+Generated code example:
+
+```go
+// UserToMap converts user.User to map[string]any
+func UserToMap(src *user.User) map[string]any {
+    if src == nil {
+        return nil
+    }
+    return map[string]any{
+        "id":         src.ID,
+        "name":       src.Name,
+        "email":      src.Email,
+        "age":        src.Age,
+        "created_at": src.CreatedAt,
+        "status":     src.Status,
+    }
+}
+```
+
+### Map to Struct
+
+Generate functions to convert maps to structs:
+
+```bash
+mapstruct -type=map:user.User -map-direction=from-map
+```
+
+Generated code example:
+
+```go
+// MapToUser converts map[string]any to user.User
+func MapToUser(src map[string]any) *user.User {
+    if src == nil {
+        return nil
+    }
+    dst := &user.User{}
+    if val, ok := src["id"]; ok {
+        dst.ID = toInt(val)
+    }
+    if val, ok := src["name"]; ok {
+        if s, ok := val.(string); ok {
+            dst.Name = s
+        }
+    }
+    // ... other fields
+    return dst
+}
+```
+
+### Both Directions
+
+Generate both conversion directions:
+
+```bash
+mapstruct -type=user.User:map -map-direction=both
+```
+
+### Custom Map Value Type
+
+Use a custom map value type:
+
+```bash
+mapstruct -type=user.User:map -map-value-type=interface{}
+```
+
 ## Advanced Examples
 
 ### Multiple Source Types
@@ -256,19 +345,25 @@ mapstruct -type=user.User:response.UserResponse,dto.OrderDTO:model.Order \
 mapstruct/
 ├── cmd/
 │   └── mapstruct/
-│       └── main.go
+│       └── main.go          # Command-line interface
 ├── generator/
-│   └── generator.go
+│   └── generator.go         # Code generation logic
 ├── parser/
-│   └── parser.go
+│   └── parser.go            # AST parsing and struct analysis
 ├── examples/
-│   ├── user/
+│   ├── user/                # Example user struct
 │   │   └── user.go
-│   ├── dto/
+│   ├── dto/                 # Example DTO struct
 │   │   └── user_dto.go
-│   └── mappers/
-│       └── generate.go
-└── go.mod
+│   ├── response/            # Example response struct
+│   │   └── user.go
+│   ├── g.go                 # Example generate directive
+│   ├── user_mappers.go      # Generated mappers
+│   └── uu.go                # Additional example
+├── .gitignore
+├── README.md
+├── go.mod
+└── go.sum
 ```
 
 ## Troubleshooting
@@ -285,7 +380,7 @@ mapstruct/
     - Ensure go.mod file exists in project root
 
 3. **Field mapping not working**
-    - Use `-debug` flag to see mapping attempts
+    - Use `-verbose` flag to see mapping attempts
     - Check field names and tags match
     - Ensure fields are exported
 
@@ -293,7 +388,7 @@ mapstruct/
 
 For detailed debugging information:
 ```bash
-mapstruct -type=... -verbose -debug
+mapstruct -type=... -verbose
 ```
 
 This will show:
@@ -312,7 +407,6 @@ This will show:
 
 ## Limitations
 
-- Only supports struct-to-struct mapping
 - No support for embedded structs (yet)
 - Custom type conversions require manual implementation
 - Circular dependencies between packages may cause issues

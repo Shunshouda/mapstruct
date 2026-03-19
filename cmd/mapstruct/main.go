@@ -17,13 +17,15 @@ import (
 )
 
 var (
-	typeNames    = flag.String("type", "", "逗号分隔的结构体类型名称对，格式为:package.Source:package.Dest")
+	typeNames    = flag.String("type", "", "逗号分隔的类型名称对，格式为:package.Source:package.Dest 或 package.Source:map 或 map:package.Dest")
 	output       = flag.String("output", "", "输出文件名")
 	packageName  = flag.String("package", "", "生成的包名")
 	includeDirs  = flag.String("include", "", "逗号分隔的要包含的目录")
 	dependencies = flag.String("dependency", "", "逗号分隔的需要解析的依赖包路径")
 	verbose      = flag.Bool("verbose", false, "显示详细日志")
 	modulePath   = flag.String("module", "", "Go Module 路径，如：github.com/user/project")
+	mapDirection = flag.String("map-direction", "both", "map转换方向: to-map(结构体转map), from-map(map转结构体), both(双向)")
+	mapValueType = flag.String("map-value-type", "any", "map的值类型: any, interface{}")
 )
 
 func main() {
@@ -62,69 +64,18 @@ func main() {
 
 	// 生成代码
 	gen := generator.NewGenerator(*packageName)
-	gen.SetAllStructs(structInfos) // 传递所有结构体信息，用于递归生成嵌套映射
+	gen.SetAllStructs(structInfos)
+	gen.SetMapConfig(*mapDirection, *mapValueType)
+
 	for _, pair := range typePairs {
-		// 尝试多种键格式来查找结构体
-		sourceKeys := []string{
-			fmt.Sprintf("%s.%s", pair.SourcePkg, pair.SourceType),
-			pair.SourceType, // 仅类型名
-		}
-
-		destKeys := []string{
-			fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType),
-			pair.DestType, // 仅类型名
-		}
-
-		var sourceInfo, destInfo *parser2.StructInfo
-		var sourceExists, destExists bool
-
-		// 查找源结构体
-		for _, key := range sourceKeys {
-			if info, exists := structInfos[key]; exists {
-				sourceInfo = info
-				sourceExists = true
-				if *verbose {
-					log.Printf("找到源结构体 %s (键：%s)", pair.SourceType, key)
-				}
-				break
-			}
-		}
-
-		// 查找目标结构体
-		for _, key := range destKeys {
-			if info, exists := structInfos[key]; exists {
-				destInfo = info
-				destExists = true
-				if *verbose {
-					log.Printf("找到目标结构体 %s (键：%s)", pair.DestType, key)
-				}
-				break
-			}
-		}
-
-		if !sourceExists {
-			log.Printf("警告：未找到源结构体 %s (尝试的键：%v)", pair.SourceType, sourceKeys)
-			// 打印可用的结构体用于调试
-			if *verbose {
-				log.Printf("可用的结构体:")
-				for key := range structInfos {
-					log.Printf("  - %s", key)
-				}
-			}
-			continue
-		}
-		if !destExists {
-			log.Printf("警告：未找到目标结构体 %s (尝试的键：%v)", pair.DestType, destKeys)
+		// 检查是否是 map 转换
+		if pair.IsMapConversion {
+			handleMapConversion(gen, pair, structInfos)
 			continue
 		}
 
-		if *verbose {
-			log.Printf("映射：%s.%s -> %s.%s",
-				sourceInfo.Package, sourceInfo.Name,
-				destInfo.Package, destInfo.Name)
-		}
-
-		gen.AddMapping(sourceInfo, destInfo)
+		// 普通结构体映射
+		handleStructMapping(gen, pair, structInfos)
 	}
 
 	// 写入文件
@@ -140,51 +91,247 @@ func main() {
 	fmt.Printf("成功生成映射代码到：%s\n", outputFile)
 }
 
-// 解析类型对 (支持 package.Type 格式)
+// handleMapConversion 处理 map 转换
+func handleMapConversion(gen *generator.Generator, pair generator.TypePair, structInfos map[string]*parser2.StructInfo) {
+	if pair.Direction == "to-map" || pair.Direction == "both" {
+		// 结构体转 map
+		var structInfo *parser2.StructInfo
+		var exists bool
+
+		keys := []string{
+			fmt.Sprintf("%s.%s", pair.SourcePkg, pair.SourceType),
+			pair.SourceType,
+		}
+
+		for _, key := range keys {
+			if info, ok := structInfos[key]; ok {
+				structInfo = info
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			log.Printf("警告：未找到源结构体 %s", pair.SourceType)
+			return
+		}
+
+		if *verbose {
+			log.Printf("映射：%s.%s -> map[string]%s",
+				structInfo.Package, structInfo.Name, pair.MapValueType)
+		}
+
+		gen.AddStructToMapMapping(structInfo)
+	}
+
+	if pair.Direction == "from-map" || pair.Direction == "both" {
+		// map 转结构体
+		var structInfo *parser2.StructInfo
+		var exists bool
+
+		keys := []string{
+			fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType),
+			pair.DestType,
+		}
+
+		for _, key := range keys {
+			if info, ok := structInfos[key]; ok {
+				structInfo = info
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			log.Printf("警告：未找到目标结构体 %s", pair.DestType)
+			return
+		}
+
+		if *verbose {
+			log.Printf("映射：map[string]%s -> %s.%s",
+				pair.MapValueType, structInfo.Package, structInfo.Name)
+		}
+
+		gen.AddMapToStructMapping(structInfo)
+	}
+}
+
+// handleStructMapping 处理普通结构体映射
+func handleStructMapping(gen *generator.Generator, pair generator.TypePair, structInfos map[string]*parser2.StructInfo) {
+	sourceKeys := []string{
+		fmt.Sprintf("%s.%s", pair.SourcePkg, pair.SourceType),
+		pair.SourceType,
+	}
+
+	destKeys := []string{
+		fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType),
+		pair.DestType,
+	}
+
+	var sourceInfo, destInfo *parser2.StructInfo
+	var sourceExists, destExists bool
+
+	for _, key := range sourceKeys {
+		if info, ok := structInfos[key]; ok {
+			sourceInfo = info
+			sourceExists = true
+			break
+		}
+	}
+
+	for _, key := range destKeys {
+		if info, ok := structInfos[key]; ok {
+			destInfo = info
+			destExists = true
+			break
+		}
+	}
+
+	if !sourceExists {
+		log.Printf("警告：未找到源结构体 %s", pair.SourceType)
+		return
+	}
+	if !destExists {
+		log.Printf("警告：未找到目标结构体 %s", pair.DestType)
+		return
+	}
+
+	if *verbose {
+		log.Printf("映射：%s.%s -> %s.%s",
+			sourceInfo.Package, sourceInfo.Name,
+			destInfo.Package, destInfo.Name)
+	}
+
+	gen.AddMapping(sourceInfo, destInfo)
+}
+
+// 解析类型对 (支持 package.Type 格式 和 map 转换)
 func parseTypePairs(input string) []generator.TypePair {
 	var pairs []generator.TypePair
 	typeStrs := strings.Split(input, ",")
 
 	for _, typeStr := range typeStrs {
 		parts := strings.Split(typeStr, ":")
-		if len(parts) == 2 {
-			sourceParts := strings.Split(strings.TrimSpace(parts[0]), ".")
-			destParts := strings.Split(strings.TrimSpace(parts[1]), ".")
+		if len(parts) != 2 {
+			continue
+		}
 
-			if len(sourceParts) == 2 && len(destParts) == 2 {
-				// 完整格式：package.Source:package.Dest
-				pairs = append(pairs, generator.TypePair{
-					SourcePkg:  sourceParts[0],
-					SourceType: sourceParts[1],
-					DestPkg:    destParts[0],
-					DestType:   destParts[1],
-				})
-			} else if len(sourceParts) == 2 && len(destParts) == 1 {
-				// 混合格式：package.Source:Dest (目标类型在当前包)
-				pairs = append(pairs, generator.TypePair{
-					SourcePkg:  sourceParts[0],
-					SourceType: sourceParts[1],
-					DestPkg:    "", // 空表示当前包
-					DestType:   destParts[0],
-				})
-			} else if len(sourceParts) == 1 && len(destParts) == 2 {
-				// 混合格式：Source:package.Dest (源类型在当前包)
-				pairs = append(pairs, generator.TypePair{
-					SourcePkg:  "", // 空表示当前包
-					SourceType: sourceParts[0],
-					DestPkg:    destParts[0],
-					DestType:   destParts[1],
-				})
-			} else if len(sourceParts) == 1 && len(destParts) == 1 {
-				// 简单格式：Source:Dest (都在当前包)
-				pairs = append(pairs, generator.TypePair{
-					SourceType: sourceParts[0],
-					DestType:   destParts[0],
-				})
-			}
+		sourcePart := strings.TrimSpace(parts[0])
+		destPart := strings.TrimSpace(parts[1])
+
+		// 检查是否是 map 转换
+		if isMapType(destPart) {
+			// 结构体转 map: Source:map 或 Source:map[string]any
+			pair := parseStructToMap(sourcePart, destPart)
+			pairs = append(pairs, pair)
+			continue
+		}
+
+		if isMapType(sourcePart) {
+			// map 转结构体: map:Dest 或 map[string]any:Dest
+			pair := parseMapToStruct(sourcePart, destPart)
+			pairs = append(pairs, pair)
+			continue
+		}
+
+		// 普通结构体映射
+		pair := parseStructPair(sourcePart, destPart)
+		if pair.SourceType != "" {
+			pairs = append(pairs, pair)
 		}
 	}
 	return pairs
+}
+
+// isMapType 检查是否是 map 类型
+func isMapType(typeStr string) bool {
+	return typeStr == "map" || strings.HasPrefix(typeStr, "map[")
+}
+
+// parseStructToMap 解析结构体转 map
+func parseStructToMap(sourcePart, destPart string) generator.TypePair {
+	sourceParts := strings.Split(sourcePart, ".")
+	mapValueType := "any"
+
+	// 解析 map 值类型
+	if strings.HasPrefix(destPart, "map[string]") {
+		mapValueType = strings.TrimPrefix(destPart, "map[string]")
+		if mapValueType == "" {
+			mapValueType = "any"
+		}
+	}
+
+	pair := generator.TypePair{
+		IsMapConversion: true,
+		Direction:       "to-map",
+		MapValueType:    mapValueType,
+	}
+
+	if len(sourceParts) == 2 {
+		pair.SourcePkg = sourceParts[0]
+		pair.SourceType = sourceParts[1]
+	} else {
+		pair.SourceType = sourceParts[0]
+	}
+
+	return pair
+}
+
+// parseMapToStruct 解析 map 转结构体
+func parseMapToStruct(sourcePart, destPart string) generator.TypePair {
+	destParts := strings.Split(destPart, ".")
+	mapValueType := "any"
+
+	// 解析 map 值类型
+	if strings.HasPrefix(sourcePart, "map[string]") {
+		mapValueType = strings.TrimPrefix(sourcePart, "map[string]")
+		if mapValueType == "" {
+			mapValueType = "any"
+		}
+	}
+
+	pair := generator.TypePair{
+		IsMapConversion: true,
+		Direction:       "from-map",
+		MapValueType:    mapValueType,
+	}
+
+	if len(destParts) == 2 {
+		pair.DestPkg = destParts[0]
+		pair.DestType = destParts[1]
+	} else {
+		pair.DestType = destParts[0]
+	}
+
+	return pair
+}
+
+// parseStructPair 解析普通结构体对
+func parseStructPair(sourcePart, destPart string) generator.TypePair {
+	sourceParts := strings.Split(sourcePart, ".")
+	destParts := strings.Split(destPart, ".")
+
+	pair := generator.TypePair{}
+
+	if len(sourceParts) == 2 && len(destParts) == 2 {
+		pair.SourcePkg = sourceParts[0]
+		pair.SourceType = sourceParts[1]
+		pair.DestPkg = destParts[0]
+		pair.DestType = destParts[1]
+	} else if len(sourceParts) == 2 && len(destParts) == 1 {
+		pair.SourcePkg = sourceParts[0]
+		pair.SourceType = sourceParts[1]
+		pair.DestType = destParts[0]
+	} else if len(sourceParts) == 1 && len(destParts) == 2 {
+		pair.SourceType = sourceParts[0]
+		pair.DestPkg = destParts[0]
+		pair.DestType = destParts[1]
+	} else if len(sourceParts) == 1 && len(destParts) == 1 {
+		pair.SourceType = sourceParts[0]
+		pair.DestType = destParts[0]
+	}
+
+	return pair
 }
 
 // 获取输出文件名
@@ -223,7 +370,6 @@ func getDependencies(deps string) []string {
 
 // 检测 Go Module 路径
 func detectModulePath() string {
-	// 查找当前目录或父目录中的 go.mod 文件
 	dir, err := os.Getwd()
 	if err != nil {
 		return ""
@@ -248,7 +394,7 @@ func detectModulePath() string {
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			break // 到达根目录
+			break
 		}
 		dir = parent
 	}
@@ -261,21 +407,17 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 	structInfos := make(map[string]*parser2.StructInfo)
 	fset := token.NewFileSet()
 
-	// 缓存已解析的目录，避免重复解析
 	parsedDirs := make(map[string]map[string]*ast.Package)
 
-	// 第一遍：收集本地目录的结构体基本信息（不解析嵌入字段和嵌套对象）
 	for _, dir := range scanDirs {
 		if *verbose {
 			log.Printf("扫描目录：%s", dir)
 		}
 
-		// 检查缓存
 		if _, exists := parsedDirs[dir]; exists {
 			continue
 		}
 
-		// 解析目录下的所有 Go 文件
 		pkgs, err := parser.ParseDir(fset, dir, nil, parser.ParseComments)
 		if err != nil {
 			log.Printf("警告：解析目录 %s 失败：%v", dir, err)
@@ -289,13 +431,11 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 					log.Printf("  解析文件：%s", fileName)
 				}
 
-				// 获取文件的包名（可能和目录名不同）
 				filePkg := pkgName
 				if file.Name != nil {
 					filePkg = file.Name.Name
 				}
 
-				// 计算完整的导入路径
 				importPath := calculateImportPath(fileName, modulePath, dir)
 
 				ast.Inspect(file, func(n ast.Node) bool {
@@ -304,31 +444,22 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 						if structType, ok := x.Type.(*ast.StructType); ok {
 							structName := x.Name.Name
 
-							// 创建多个键来支持不同的查找方式
 							keys := []string{
-								fmt.Sprintf("%s.%s", filePkg, structName), // 包名。类型名
-								structName, // 仅类型名（用于同包内的类型）
+								fmt.Sprintf("%s.%s", filePkg, structName),
+								structName,
 							}
 
-							// 第一遍：只收集基本信息，不解析嵌入字段
 							structInfo := parser2.ParseStruct(structName, structType, file, nil)
 							structInfo.Package = filePkg
 							structInfo.FilePath = fileName
 							structInfo.ImportPath = importPath
 
-							// 为每个键存储结构体信息
 							for _, key := range keys {
-								if existing, exists := structInfos[key]; exists {
-									if *verbose {
-										log.Printf("    警告：键 %s 已存在 (%s)，覆盖为 %s",
-											key, existing.Package, filePkg)
-									}
-								}
 								structInfos[key] = structInfo
 							}
 
 							if *verbose {
-								log.Printf("    找到结构体：%s (包：%s, 导入路径：%s)", structName, filePkg, importPath)
+								log.Printf("    找到结构体：%s (包：%s)", structName, filePkg)
 							}
 						}
 					}
@@ -338,20 +469,15 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 		}
 	}
 
-	// 第二遍：解析依赖包中的结构体
 	if len(dependencies) > 0 {
 		loadDependencyStructs(dependencies, structInfos, fset, *verbose)
 	}
 
-	// 第三遍：重新解析所有结构体，这次传入 allStructs 以解析嵌入字段和嵌套对象
-	// 优化：使用缓存的解析结果，避免重新读取文件
 	for key, info := range structInfos {
-		// 如果是依赖包的结构体，跳过文件重新解析
 		if isDependencyStruct(info.ImportPath, modulePath) {
 			continue
 		}
 
-		// 从缓存的解析结果中查找文件
 		for _, dir := range scanDirs {
 			pkgs, exists := parsedDirs[dir]
 			if !exists {
@@ -369,17 +495,11 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 						case *ast.TypeSpec:
 							if structType, ok := x.Type.(*ast.StructType); ok {
 								if x.Name.Name == info.Name {
-									// 使用 allStructs 重新解析，包含嵌入字段和嵌套对象
 									newInfo := parser2.ParseStruct(info.Name, structType, file, structInfos)
 									newInfo.Package = info.Package
 									newInfo.FilePath = info.FilePath
 									newInfo.ImportPath = info.ImportPath
 									structInfos[key] = newInfo
-
-									if *verbose {
-										log.Printf("    重新解析结构体：%s (嵌入字段：%d, 嵌套对象：%d)",
-											info.Name, len(newInfo.EmbeddedTypes), countNestedObjects(newInfo.Fields))
-									}
 								}
 							}
 						}
@@ -395,7 +515,6 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 
 // loadDependencyStructs 从依赖包中加载结构体信息
 func loadDependencyStructs(dependencies []string, structInfos map[string]*parser2.StructInfo, fset *token.FileSet, verbose bool) {
-	// 使用 go/packages 加载依赖包
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedSyntax,
 		Fset: fset,
@@ -419,8 +538,6 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 
 			for _, syntax := range pkg.Syntax {
 				filePkg := pkg.Name
-
-				// 计算依赖包的导入路径
 				importPath := pkg.PkgPath
 
 				ast.Inspect(syntax, func(n ast.Node) bool {
@@ -429,32 +546,23 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 						if structType, ok := x.Type.(*ast.StructType); ok {
 							structName := x.Name.Name
 
-							// 创建多个键来支持不同的查找方式
 							keys := []string{
-								fmt.Sprintf("%s.%s", filePkg, structName), // 包名。类型名
-								structName,                    // 仅类型名
-								importPath + "." + structName, // 导入路径。类型名
+								fmt.Sprintf("%s.%s", filePkg, structName),
+								structName,
+								importPath + "." + structName,
 							}
 
-							// 解析依赖包中的结构体
 							structInfo := parser2.ParseStruct(structName, structType, syntax, structInfos)
 							structInfo.Package = filePkg
-							structInfo.FilePath = pkg.GoFiles[0] // 使用第一个文件作为代表
+							structInfo.FilePath = pkg.GoFiles[0]
 							structInfo.ImportPath = importPath
 
-							// 为每个键存储结构体信息
 							for _, key := range keys {
-								if existing, exists := structInfos[key]; exists {
-									if verbose {
-										log.Printf("    警告：键 %s 已存在 (%s)，覆盖为 %s",
-											key, existing.Package, filePkg)
-									}
-								}
 								structInfos[key] = structInfo
 							}
 
 							if verbose {
-								log.Printf("    找到依赖结构体：%s (包：%s, 导入路径：%s)", structName, filePkg, importPath)
+								log.Printf("    找到依赖结构体：%s", structName)
 							}
 						}
 					}
@@ -470,26 +578,12 @@ func isDependencyStruct(importPath, modulePath string) bool {
 	if importPath == "" || modulePath == "" {
 		return false
 	}
-
-	// 如果导入路径不包含模块路径，说明是外部依赖
 	return !strings.HasPrefix(importPath, modulePath)
-}
-
-// countNestedObjects 统计嵌套对象数量（用于调试）
-func countNestedObjects(fields []parser2.FieldInfo) int {
-	count := 0
-	for _, field := range fields {
-		if field.IsNestedObject {
-			count++
-		}
-	}
-	return count
 }
 
 // 计算完整的导入路径
 func calculateImportPath(filePath, modulePath, baseDir string) string {
 	if modulePath == "" {
-		// 如果没有模块路径，返回相对路径
 		relPath, err := filepath.Rel(baseDir, filepath.Dir(filePath))
 		if err != nil {
 			return filepath.Dir(filePath)
@@ -500,7 +594,6 @@ func calculateImportPath(filePath, modulePath, baseDir string) string {
 		return relPath
 	}
 
-	// 计算相对于模块根目录的路径
 	absFilePath, err := filepath.Abs(filepath.Dir(filePath))
 	if err != nil {
 		return modulePath
@@ -511,13 +604,11 @@ func calculateImportPath(filePath, modulePath, baseDir string) string {
 		return modulePath
 	}
 
-	// 找到模块根目录（包含 go.mod 的目录）
 	moduleRoot := findModuleRoot(absBaseDir)
 	if moduleRoot == "" {
 		return modulePath
 	}
 
-	// 计算相对于模块根目录的路径
 	relPath, err := filepath.Rel(moduleRoot, absFilePath)
 	if err != nil {
 		return modulePath
@@ -541,7 +632,7 @@ func findModuleRoot(startDir string) string {
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			break // 到达根目录
+			break
 		}
 		dir = parent
 	}

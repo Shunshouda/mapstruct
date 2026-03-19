@@ -319,6 +319,9 @@ func parseJSONTag(tag string) string {
 
 	// 处理 json:"name,omitempty" 这种情况
 	parts := strings.Split(jsonTag, ",")
+	if parts[0] == "-" {
+		return "" // 忽略 -
+	}
 	return parts[0]
 }
 

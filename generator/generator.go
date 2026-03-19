@@ -4,16 +4,20 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/shunshouda/mapstruct/parser"
 )
 
 // TypePair 类型对
 type TypePair struct {
-	SourcePkg  string
-	SourceType string
-	DestPkg    string
-	DestType   string
+	SourcePkg       string
+	SourceType      string
+	DestPkg         string
+	DestType        string
+	IsMapConversion bool   // 是否是 map 转换
+	Direction       string // to-map, from-map, both
+	MapValueType    string // map 值类型: any, interface{} 等
 }
 
 // FieldMapping 字段映射
@@ -32,13 +36,24 @@ type StructMapping struct {
 	NeedImports map[string]string // 包名 -> 导入路径
 }
 
+// MapMapping map 映射配置
+type MapMapping struct {
+	Struct       *parser.StructInfo
+	Direction    string // "to-map", "from-map"
+	MapValueType string // map 值类型
+	MethodName   string
+}
+
 // Generator 代码生成器
 type Generator struct {
 	PackageName       string
 	StructMappings    []StructMapping
+	MapMappings       []MapMapping
 	UsedPackages      map[string]string             // 包名 -> 导入路径
 	allStructs        map[string]*parser.StructInfo // 所有结构体信息，用于递归生成
 	generatedMappings map[string]bool               // 记录已生成的映射，避免重复
+	mapDirection      string                        // map 转换方向配置
+	mapValueType      string                        // map 值类型配置
 }
 
 // NewGenerator 创建新的生成器
@@ -46,15 +61,28 @@ func NewGenerator(packageName string) *Generator {
 	return &Generator{
 		PackageName:       packageName,
 		StructMappings:    make([]StructMapping, 0),
+		MapMappings:       make([]MapMapping, 0),
 		UsedPackages:      make(map[string]string),
 		allStructs:        make(map[string]*parser.StructInfo),
 		generatedMappings: make(map[string]bool),
+		mapDirection:      "both",
+		mapValueType:      "any",
 	}
 }
 
 // SetAllStructs 设置所有结构体信息，用于递归生成嵌套映射
 func (g *Generator) SetAllStructs(allStructs map[string]*parser.StructInfo) {
 	g.allStructs = allStructs
+}
+
+// SetMapConfig 设置 map 转换配置
+func (g *Generator) SetMapConfig(direction, valueType string) {
+	if direction != "" {
+		g.mapDirection = direction
+	}
+	if valueType != "" {
+		g.mapValueType = valueType
+	}
 }
 
 // AddMapping 添加结构体映射
@@ -67,7 +95,7 @@ func (g *Generator) AddMapping(source, dest *parser.StructInfo) {
 		NeedImports: make(map[string]string),
 	}
 
-	// 记录需要导入的包 - 使用完整的导入路径
+	// 记录需要导入的包
 	if source.Package != g.PackageName && source.ImportPath != "" {
 		importAlias := g.getImportAlias(source.Package, source.ImportPath)
 		mapping.NeedImports[importAlias] = source.ImportPath
@@ -89,18 +117,51 @@ func (g *Generator) AddMapping(source, dest *parser.StructInfo) {
 	g.generatedMappings[mappingKey] = true
 }
 
+// AddStructToMapMapping 添加结构体转 map 映射
+func (g *Generator) AddStructToMapMapping(structInfo *parser.StructInfo) {
+	mapping := MapMapping{
+		Struct:       structInfo,
+		Direction:    "to-map",
+		MapValueType: g.mapValueType,
+		MethodName:   fmt.Sprintf("%sToMap", structInfo.Name),
+	}
+
+	g.MapMappings = append(g.MapMappings, mapping)
+
+	// 记录需要导入的包
+	if structInfo.Package != g.PackageName && structInfo.ImportPath != "" {
+		importAlias := g.getImportAlias(structInfo.Package, structInfo.ImportPath)
+		g.UsedPackages[importAlias] = structInfo.ImportPath
+	}
+}
+
+// AddMapToStructMapping 添加 map 转结构体映射
+func (g *Generator) AddMapToStructMapping(structInfo *parser.StructInfo) {
+	mapping := MapMapping{
+		Struct:       structInfo,
+		Direction:    "from-map",
+		MapValueType: g.mapValueType,
+		MethodName:   fmt.Sprintf("MapTo%s", structInfo.Name),
+	}
+
+	g.MapMappings = append(g.MapMappings, mapping)
+
+	// 记录需要导入的包
+	if structInfo.Package != g.PackageName && structInfo.ImportPath != "" {
+		importAlias := g.getImportAlias(structInfo.Package, structInfo.ImportPath)
+		g.UsedPackages[importAlias] = structInfo.ImportPath
+	}
+}
+
 // getImportAlias 获取导入别名
 func (g *Generator) getImportAlias(pkgName, importPath string) string {
-	// 如果包名在导入路径的最后一部分，使用包名作为别名
 	base := filepath.Base(importPath)
 	if base == pkgName {
 		return pkgName
 	}
 
-	// 检查是否已有冲突的导入
 	for alias, path := range g.UsedPackages {
 		if alias == pkgName && path != importPath {
-			// 有冲突，使用导入路径的最后两部分作为别名
 			parts := strings.Split(importPath, "/")
 			if len(parts) >= 2 {
 				return parts[len(parts)-2] + "_" + parts[len(parts)-1]
@@ -109,7 +170,6 @@ func (g *Generator) getImportAlias(pkgName, importPath string) string {
 		}
 	}
 
-	// 否则，使用包名作为别名（避免冲突时可能需要处理）
 	return pkgName
 }
 
@@ -134,7 +194,6 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 			continue
 		}
 
-		// 跳过已映射的字段
 		alreadyMapped := false
 		for _, mapping := range mappings {
 			if mapping.SourceField.Name == sourceField.Name {
@@ -157,7 +216,6 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 
 	// 3. 然后处理同名字段
 	for _, sourceField := range source.Fields {
-		// 跳过已映射的字段
 		alreadyMapped := false
 		for _, mapping := range mappings {
 			if mapping.SourceField.Name == sourceField.Name {
@@ -195,6 +253,8 @@ func (g *Generator) Generate() (string, error) {
 		builder.WriteString(fmt.Sprintf("package %s\n\n", g.PackageName))
 	} else if len(g.StructMappings) > 0 {
 		builder.WriteString(fmt.Sprintf("package %s\n\n", g.StructMappings[0].Source.Package))
+	} else if len(g.MapMappings) > 0 {
+		builder.WriteString(fmt.Sprintf("package %s\n\n", g.MapMappings[0].Struct.Package))
 	} else {
 		builder.WriteString("package main\n\n")
 	}
@@ -204,7 +264,6 @@ func (g *Generator) Generate() (string, error) {
 		builder.WriteString("import (\n")
 		for alias, importPath := range g.UsedPackages {
 			if alias != "" && importPath != "" {
-				// 只有当别名和导入路径的最后一个部分不同时才使用别名
 				basePkg := filepath.Base(importPath)
 				if alias == basePkg {
 					builder.WriteString(fmt.Sprintf("\t\"%s\"\n", importPath))
@@ -216,43 +275,48 @@ func (g *Generator) Generate() (string, error) {
 		builder.WriteString(")\n\n")
 	}
 
-	// 首先生成所有主映射函数（不生成嵌套映射的代码）
+	// 生成结构体映射函数
 	for _, mapping := range g.StructMappings {
 		builder.WriteString(g.generateMappingFunction(mapping))
 		builder.WriteString("\n\n")
 	}
 
-	// 然后生成所有需要的嵌套对象映射函数
+	// 生成嵌套对象映射函数
 	g.generateNestedMappings(&builder)
+
+	// 生成 map 映射函数
+	for _, mapping := range g.MapMappings {
+		if mapping.Direction == "to-map" {
+			builder.WriteString(g.generateStructToMapFunction(mapping))
+		} else {
+			builder.WriteString(g.generateMapToStructFunction(mapping))
+		}
+		builder.WriteString("\n\n")
+	}
 
 	return builder.String(), nil
 }
 
 // generateNestedMappings 生成所有嵌套对象的映射函数
 func (g *Generator) generateNestedMappings(builder *strings.Builder) {
-	// 收集所有需要生成的嵌套映射
 	toGenerate := make([]struct {
 		source *parser.StructInfo
 		dest   *parser.StructInfo
 	}, 0)
 
-	// 遍历所有已注册的映射，查找嵌套对象
 	for _, mapping := range g.StructMappings {
 		g.collectNestedMappings(mapping.Source, mapping.Dest, &toGenerate)
 	}
 
-	// 生成收集到的嵌套映射
 	for _, pair := range toGenerate {
 		mappingKey := fmt.Sprintf("%s.%s->%s.%s",
 			pair.source.Package, pair.source.Name,
 			pair.dest.Package, pair.dest.Name)
 
-		// 如果已经生成过，跳过
 		if g.generatedMappings[mappingKey] {
 			continue
 		}
 
-		// 创建新的映射
 		newMapping := StructMapping{
 			Source:      pair.source,
 			Dest:        pair.dest,
@@ -261,7 +325,6 @@ func (g *Generator) generateNestedMappings(builder *strings.Builder) {
 			NeedImports: make(map[string]string),
 		}
 
-		// 记录需要导入的包
 		if pair.source.Package != g.PackageName && pair.source.ImportPath != "" {
 			importAlias := g.getImportAlias(pair.source.Package, pair.source.ImportPath)
 			newMapping.NeedImports[importAlias] = pair.source.ImportPath
@@ -274,14 +337,10 @@ func (g *Generator) generateNestedMappings(builder *strings.Builder) {
 			g.UsedPackages[importAlias] = pair.dest.ImportPath
 		}
 
-		// 生成映射函数
 		builder.WriteString(g.generateMappingFunction(newMapping))
 		builder.WriteString("\n\n")
 
-		// 标记为已生成
 		g.generatedMappings[mappingKey] = true
-
-		// 递归处理这个嵌套映射的子嵌套对象
 		g.collectNestedMappings(pair.source, pair.dest, &toGenerate)
 	}
 }
@@ -291,7 +350,6 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 	source *parser.StructInfo
 	dest   *parser.StructInfo
 }) {
-	// 使用 map 来避免重复检查，O(1) 复杂度
 	existingMap := make(map[string]bool, len(*toGenerate))
 	for _, pair := range *toGenerate {
 		key := fmt.Sprintf("%s.%s->%s.%s",
@@ -300,17 +358,13 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 		existingMap[key] = true
 	}
 
-	// 遍历源结构体的所有字段
 	for _, sourceField := range source.Fields {
-		// 如果不是嵌套对象，跳过
 		if !sourceField.IsNestedObject || sourceField.NestedStructInfo == nil {
 			continue
 		}
 
-		// 在目标结构体中查找对应的字段
 		destField := dest.GetFieldByName(sourceField.Name)
 		if destField == nil {
-			// 尝试通过 JSON 标签查找
 			if sourceField.JSONName != "" {
 				destField = dest.GetFieldByJSONName(sourceField.JSONName)
 			}
@@ -320,7 +374,6 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 			continue
 		}
 
-		// 找到一对嵌套对象
 		nestedSource := sourceField.NestedStructInfo
 		nestedDest := destField.NestedStructInfo
 
@@ -345,31 +398,26 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 	}
 }
 
-// generateMappingFunction 生成单个映射函数
+// generateMappingFunction 生成单个结构体映射函数
 func (g *Generator) generateMappingFunction(mapping StructMapping) string {
 	var builder strings.Builder
 
-	// 函数注释
 	builder.WriteString(fmt.Sprintf("// %s 将 %s.%s 映射到 %s.%s\n",
 		mapping.MethodName, mapping.Source.Package, mapping.Source.Name,
 		mapping.Dest.Package, mapping.Dest.Name))
 
-	// 函数签名
 	sourceType := g.getQualifiedType(mapping.Source)
 	destType := g.getQualifiedType(mapping.Dest)
 
 	builder.WriteString(fmt.Sprintf("func %s(src *%s) *%s {\n",
 		mapping.MethodName, sourceType, destType))
 
-	// 空值检查
 	builder.WriteString("\tif src == nil {\n")
 	builder.WriteString("\t\treturn nil\n")
 	builder.WriteString("\t}\n\n")
 
-	// 创建目标对象
 	builder.WriteString(fmt.Sprintf("\tdst := &%s{}\n\n", destType))
 
-	// 字段赋值
 	for _, fieldMap := range mapping.FieldMaps {
 		assignment := g.generateFieldAssignment(mapping, fieldMap)
 		if assignment != "" {
@@ -383,13 +431,207 @@ func (g *Generator) generateMappingFunction(mapping StructMapping) string {
 	return builder.String()
 }
 
+// generateStructToMapFunction 生成结构体转 map 函数
+func (g *Generator) generateStructToMapFunction(mapping MapMapping) string {
+	var builder strings.Builder
+
+	structType := g.getQualifiedTypeForMap(mapping.Struct)
+
+	builder.WriteString(fmt.Sprintf("// %s 将 %s.%s 转换为 map[string]%s\n",
+		mapping.MethodName, mapping.Struct.Package, mapping.Struct.Name, mapping.MapValueType))
+
+	builder.WriteString(fmt.Sprintf("func %s(src *%s) map[string]%s {\n",
+		mapping.MethodName, structType, mapping.MapValueType))
+
+	builder.WriteString("\tif src == nil {\n")
+	builder.WriteString("\t\treturn nil\n")
+	builder.WriteString("\t}\n\n")
+
+	builder.WriteString(fmt.Sprintf("\treturn map[string]%s{\n", mapping.MapValueType))
+
+	for _, field := range mapping.Struct.Fields {
+		mapKey := g.getMapKey(field)
+		fieldAccess := g.getFieldAccess(field)
+		valueExpr := g.generateMapValueExpr(field, "src."+fieldAccess)
+		builder.WriteString(fmt.Sprintf("\t\t\"%s\": %s,\n", mapKey, valueExpr))
+	}
+
+	builder.WriteString("\t}\n")
+	builder.WriteString("}\n")
+
+	return builder.String()
+}
+
+// generateMapToStructFunction 生成 map 转结构体函数
+func (g *Generator) generateMapToStructFunction(mapping MapMapping) string {
+	var builder strings.Builder
+
+	structType := g.getQualifiedTypeForMap(mapping.Struct)
+
+	builder.WriteString(fmt.Sprintf("// %s 将 map[string]%s 转换为 %s.%s\n",
+		mapping.MethodName, mapping.MapValueType, mapping.Struct.Package, mapping.Struct.Name))
+
+	builder.WriteString(fmt.Sprintf("func %s(src map[string]%s) *%s {\n",
+		mapping.MethodName, mapping.MapValueType, structType))
+
+	builder.WriteString("\tif src == nil {\n")
+	builder.WriteString("\t\treturn nil\n")
+	builder.WriteString("\t}\n\n")
+
+	builder.WriteString(fmt.Sprintf("\tdst := &%s{}\n\n", structType))
+
+	for _, field := range mapping.Struct.Fields {
+		mapKey := g.getMapKey(field)
+		builder.WriteString(g.generateMapToFieldAssignment(field, mapKey))
+	}
+
+	builder.WriteString("\n\treturn dst\n")
+	builder.WriteString("}\n")
+
+	return builder.String()
+}
+
+// getMapKey 获取字段对应的 map key
+// 优先使用 json tag，其次使用字段名（首字母小写）
+func (g *Generator) getMapKey(field parser.FieldInfo) string {
+	// 优先使用 json tag
+	if field.JSONName != "" {
+		return field.JSONName
+	}
+
+	// 使用字段名，首字母小写
+	return toLowerFirst(field.Name)
+}
+
+// toLowerFirst 将字符串首字母小写
+func toLowerFirst(s string) string {
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	r[0] = unicode.ToLower(r[0])
+	return string(r)
+}
+
+// getFieldAccess 获取字段访问路径
+func (g *Generator) getFieldAccess(field parser.FieldInfo) string {
+	if len(field.EmbeddedPath) > 0 {
+		return strings.Join(field.EmbeddedPath, ".") + "." + field.Name
+	}
+	return field.Name
+}
+
+// generateMapValueExpr 生成 map 值表达式
+func (g *Generator) generateMapValueExpr(field parser.FieldInfo, fieldRef string) string {
+	fieldType := field.Type
+
+	// 指针类型处理
+	if strings.HasPrefix(fieldType, "*") {
+		baseType := strings.TrimPrefix(fieldType, "*")
+		return fmt.Sprintf("func() %s { if %s != nil { return *%s }; return %s }()", g.mapValueType, fieldRef, fieldRef, g.getZeroValue(baseType))
+	}
+
+	// 基本类型直接返回
+	return fieldRef
+}
+
+// generateMapToFieldAssignment 生成从 map 到字段的赋值代码
+func (g *Generator) generateMapToFieldAssignment(field parser.FieldInfo, mapKey string) string {
+	var builder strings.Builder
+
+	fieldType := field.Type
+	fieldRef := "dst." + g.getFieldAccess(field)
+
+	// 检查 map 中是否存在该 key
+	builder.WriteString(fmt.Sprintf("\tif val, ok := src[\"%s\"]; ok {\n", mapKey))
+
+	// 根据字段类型生成转换代码
+	switch {
+	case fieldType == "string":
+		builder.WriteString(fmt.Sprintf("\t\tif s, ok := val.(string); ok {\n"))
+		builder.WriteString(fmt.Sprintf("\t\t\t%s = s\n", fieldRef))
+		builder.WriteString("\t\t}\n")
+
+	case fieldType == "int":
+		builder.WriteString(fmt.Sprintf("\t\t%s = toInt(val)\n", fieldRef))
+	case fieldType == "int8":
+		builder.WriteString(fmt.Sprintf("\t\t%s = int8(toInt(val))\n", fieldRef))
+	case fieldType == "int16":
+		builder.WriteString(fmt.Sprintf("\t\t%s = int16(toInt(val))\n", fieldRef))
+	case fieldType == "int32":
+		builder.WriteString(fmt.Sprintf("\t\t%s = int32(toInt(val))\n", fieldRef))
+	case fieldType == "int64":
+		builder.WriteString(fmt.Sprintf("\t\t%s = int64(toInt(val))\n", fieldRef))
+
+	case fieldType == "float32":
+		builder.WriteString(fmt.Sprintf("\t\t%s = float32(toFloat(val))\n", fieldRef))
+	case fieldType == "float64":
+		builder.WriteString(fmt.Sprintf("\t\t%s = toFloat(val)\n", fieldRef))
+
+	case fieldType == "bool":
+		builder.WriteString(fmt.Sprintf("\t\tif b, ok := val.(bool); ok {\n"))
+		builder.WriteString(fmt.Sprintf("\t\t\t%s = b\n", fieldRef))
+		builder.WriteString("\t\t}\n")
+
+	case strings.HasPrefix(fieldType, "[]"):
+		builder.WriteString(fmt.Sprintf("\t\tif arr, ok := val.([]%s); ok {\n", g.mapValueType))
+		builder.WriteString(fmt.Sprintf("\t\t\t%s = toStringSlice(arr)\n", fieldRef))
+		builder.WriteString("\t\t}\n")
+
+	case strings.HasPrefix(fieldType, "*"):
+		// 指针类型
+		baseType := strings.TrimPrefix(fieldType, "*")
+		builder.WriteString(fmt.Sprintf("\t\t%s = toPointer(%s, val)\n", fieldRef, g.getTypeConversion(baseType)))
+
+	default:
+		builder.WriteString(fmt.Sprintf("\t\t%s = val\n", fieldRef))
+	}
+
+	builder.WriteString("\t}\n")
+
+	return builder.String()
+}
+
+// getZeroValue 获取类型的零值
+func (g *Generator) getZeroValue(typeName string) string {
+	switch typeName {
+	case "int", "int8", "int16", "int32", "int64":
+		return "0"
+	case "float32", "float64":
+		return "0"
+	case "bool":
+		return "false"
+	case "string":
+		return "\"\""
+	default:
+		return "nil"
+	}
+}
+
+// getTypeConversion 获取类型转换函数
+func (g *Generator) getTypeConversion(typeName string) string {
+	switch typeName {
+	case "int":
+		return "toInt"
+	case "int8", "int16", "int32", "int64":
+		return "toInt"
+	case "float32", "float64":
+		return "toFloat"
+	case "string":
+		return "toString"
+	case "bool":
+		return "toBool"
+	default:
+		return ""
+	}
+}
+
 // getQualifiedType 获取限定类型名（包含包名）
 func (g *Generator) getQualifiedType(structInfo *parser.StructInfo) string {
 	if structInfo.Package == g.PackageName || structInfo.Package == "" {
 		return structInfo.Name
 	}
 
-	// 查找导入别名
 	for alias, importPath := range g.UsedPackages {
 		basePkg := filepath.Base(importPath)
 		if alias == structInfo.Package || basePkg == structInfo.Package {
@@ -400,12 +642,16 @@ func (g *Generator) getQualifiedType(structInfo *parser.StructInfo) string {
 	return structInfo.Package + "." + structInfo.Name
 }
 
+// getQualifiedTypeForMap 获取用于 map 转换的限定类型名
+func (g *Generator) getQualifiedTypeForMap(structInfo *parser.StructInfo) string {
+	return g.getQualifiedType(structInfo)
+}
+
 // generateFieldAssignment 生成字段赋值语句
 func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap FieldMapping) string {
 	sourceType := fieldMap.SourceField.Type
 	destType := fieldMap.DestField.Type
 
-	// 构建源字段访问路径
 	var sourceFieldPath []string
 	if len(fieldMap.SourceField.EmbeddedPath) > 0 {
 		sourceFieldPath = append(sourceFieldPath, fieldMap.SourceField.EmbeddedPath...)
@@ -413,7 +659,6 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 	sourceFieldPath = append(sourceFieldPath, fieldMap.SourceField.Name)
 	sourceFieldRef := "src." + strings.Join(sourceFieldPath, ".")
 
-	// 构建目标字段访问路径
 	var destFieldPath []string
 	if len(fieldMap.DestField.EmbeddedPath) > 0 {
 		destFieldPath = append(destFieldPath, fieldMap.DestField.EmbeddedPath...)
@@ -427,7 +672,6 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 			fieldMap.SourceField.NestedStructInfo.Name,
 			fieldMap.DestField.NestedStructInfo.Name)
 
-		// 处理指针类型
 		if strings.HasPrefix(sourceType, "*") && strings.HasPrefix(destType, "*") {
 			return fmt.Sprintf("%s = %s(%s)", destFieldRef, methodName, sourceFieldRef)
 		}
@@ -441,7 +685,6 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 			return fmt.Sprintf("%s = %s(&%s)", destFieldRef, methodName, sourceFieldRef)
 		}
 
-		// 都是值类型 - 辅助方法返回指针，需要解引用以匹配值类型字段
 		return fmt.Sprintf("%s = *%s(&%s)", destFieldRef, methodName, sourceFieldRef)
 	}
 
@@ -482,9 +725,8 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 			sourceFieldRef, destFieldRef)
 	}
 
-	// 跨包类型转换（简化处理）
+	// 跨包类型转换
 	if g.isSameTypeDifferentPackage(sourceType, destType, mapping) {
-		// 如果是同一个类型但在不同的包，直接赋值
 		return fmt.Sprintf("%s = %s", destFieldRef, sourceFieldRef)
 	}
 
@@ -524,7 +766,6 @@ func (g *Generator) isConvertibleType(sourceType, destType string) bool {
 
 // isSameTypeDifferentPackage 检查是否是同类型但在不同包
 func (g *Generator) isSameTypeDifferentPackage(sourceType, destType string, mapping StructMapping) bool {
-	// 简化实现：检查类型名是否相同但包不同
 	sourceTypeName := g.getTypeNameWithoutPackage(sourceType)
 	destTypeName := g.getTypeNameWithoutPackage(destType)
 
