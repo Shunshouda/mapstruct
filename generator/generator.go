@@ -3,6 +3,7 @@ package generator
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"unicode"
 
@@ -447,16 +448,20 @@ func (g *Generator) generateStructToMapFunction(mapping MapMapping) string {
 	builder.WriteString("\t\treturn nil\n")
 	builder.WriteString("\t}\n\n")
 
-	builder.WriteString(fmt.Sprintf("\treturn map[string]%s{\n", mapping.MapValueType))
+	builder.WriteString(fmt.Sprintf("\tresult := make(map[string]%s)\n", mapping.MapValueType))
 
 	for _, field := range mapping.Struct.Fields {
 		mapKey := g.getMapKey(field)
+		// 如果 mapKey 为空，表示该字段被忽略（mapstruct:"-"）
+		if mapKey == "" {
+			continue
+		}
 		fieldAccess := g.getFieldAccess(field)
 		valueExpr := g.generateMapValueExpr(field, "src."+fieldAccess)
-		builder.WriteString(fmt.Sprintf("\t\t\"%s\": %s,\n", mapKey, valueExpr))
+		builder.WriteString(fmt.Sprintf("\tresult[\"%s\"] = %s\n", mapKey, valueExpr))
 	}
 
-	builder.WriteString("\t}\n")
+	builder.WriteString("\treturn result\n")
 	builder.WriteString("}\n")
 
 	return builder.String()
@@ -482,6 +487,10 @@ func (g *Generator) generateMapToStructFunction(mapping MapMapping) string {
 
 	for _, field := range mapping.Struct.Fields {
 		mapKey := g.getMapKey(field)
+		// 如果 mapKey 为空，表示该字段被忽略（mapstruct:"-"）
+		if mapKey == "" {
+			continue
+		}
 		builder.WriteString(g.generateMapToFieldAssignment(field, mapKey))
 	}
 
@@ -492,15 +501,50 @@ func (g *Generator) generateMapToStructFunction(mapping MapMapping) string {
 }
 
 // getMapKey 获取字段对应的 map key
-// 优先使用 json tag，其次使用字段名（首字母小写）
+// 优先使用 mapstruct tag，其次是 json tag，最后使用字段名（首字母小写）
 func (g *Generator) getMapKey(field parser.FieldInfo) string {
-	// 优先使用 json tag
+	// 优先使用 mapstruct tag
+	if hasMapStructIgnoreTag(field.Tag) {
+		// 如果 mapstruct 标签是 "-", 返回空字符串表示忽略该字段
+		return ""
+	}
+
+	if mapStructKey := getMapStructKey(field.Tag); mapStructKey != "" {
+		return mapStructKey
+	}
+
+	// 其次使用 json tag
 	if field.JSONName != "" {
 		return field.JSONName
 	}
 
 	// 使用字段名，首字母小写
 	return toLowerFirst(field.Name)
+}
+
+// getMapStructKey 获取 mapstruct 标签的值
+func getMapStructKey(tag string) string {
+	if tag == "" {
+		return ""
+	}
+
+	structTag := reflect.StructTag(tag)
+	mapStructTag := structTag.Get("mapstruct")
+	if mapStructTag == "" || mapStructTag == "-" {
+		return ""
+	}
+	return mapStructTag
+}
+
+// hasMapStructIgnoreTag 检查字段是否有 mapstruct:"-" 标签
+func hasMapStructIgnoreTag(tag string) bool {
+	if tag == "" {
+		return false
+	}
+
+	structTag := reflect.StructTag(tag)
+	mapStructTag := structTag.Get("mapstruct")
+	return mapStructTag == "-"
 }
 
 // toLowerFirst 将字符串首字母小写
