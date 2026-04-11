@@ -164,15 +164,18 @@ func handleMapConversion(gen *generator.Generator, pair generator.TypePair, stru
 
 // handleStructMapping 处理普通结构体映射
 func handleStructMapping(gen *generator.Generator, pair generator.TypePair, structInfos map[string]*parser2.StructInfo) {
-	sourceKeys := []string{
-		fmt.Sprintf("%s.%s", pair.SourcePkg, pair.SourceType),
-		pair.SourceType,
+	// 优先使用带包名的完整路径查找
+	sourceKeys := []string{}
+	if pair.SourcePkg != "" {
+		sourceKeys = append(sourceKeys, fmt.Sprintf("%s.%s", pair.SourcePkg, pair.SourceType))
 	}
+	sourceKeys = append(sourceKeys, pair.SourceType)
 
-	destKeys := []string{
-		fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType),
-		pair.DestType,
+	destKeys := []string{}
+	if pair.DestPkg != "" {
+		destKeys = append(destKeys, fmt.Sprintf("%s.%s", pair.DestPkg, pair.DestType))
 	}
+	destKeys = append(destKeys, pair.DestType)
 
 	var sourceInfo, destInfo *parser2.StructInfo
 	var sourceExists, destExists bool
@@ -181,6 +184,9 @@ func handleStructMapping(gen *generator.Generator, pair generator.TypePair, stru
 		if info, ok := structInfos[key]; ok {
 			sourceInfo = info
 			sourceExists = true
+			if *verbose {
+				log.Printf("  找到源结构体：键=%s, 包=%s, 导入路径=%s", key, info.Package, info.ImportPath)
+			}
 			break
 		}
 	}
@@ -194,7 +200,7 @@ func handleStructMapping(gen *generator.Generator, pair generator.TypePair, stru
 	}
 
 	if !sourceExists {
-		log.Printf("警告：未找到源结构体 %s", pair.SourceType)
+		log.Printf("警告：未找到源结构体 %s (尝试的键：%v)", pair.SourceType, sourceKeys)
 		return
 	}
 	if !destExists {
@@ -203,9 +209,9 @@ func handleStructMapping(gen *generator.Generator, pair generator.TypePair, stru
 	}
 
 	if *verbose {
-		log.Printf("映射：%s.%s -> %s.%s",
-			sourceInfo.Package, sourceInfo.Name,
-			destInfo.Package, destInfo.Name)
+		log.Printf("映射：%s.%s (导入路径: %s) -> %s.%s (导入路径: %s)",
+			sourceInfo.Package, sourceInfo.Name, sourceInfo.ImportPath,
+			destInfo.Package, destInfo.Name, destInfo.ImportPath)
 	}
 
 	gen.AddMapping(sourceInfo, destInfo)
@@ -422,6 +428,15 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 
 	parsedDirs := make(map[string]map[string]*ast.Package)
 
+	// 类型别名信息：别名 -> 包信息
+	type typeAliasPkgInfo struct {
+		Underlying string
+		PkgName    string
+		ImportPath string
+		FilePath   string
+	}
+	typeAliases := make(map[string]typeAliasPkgInfo)
+
 	for _, dir := range scanDirs {
 		if *verbose {
 			log.Printf("扫描目录：%s", dir)
@@ -472,7 +487,28 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 							}
 
 							if *verbose {
-								log.Printf("    找到结构体：%s (包：%s)", structName, filePkg)
+								log.Printf("    找到结构体：%s (包：%s, 导入路径：%s)", structName, filePkg, importPath)
+							}
+						} else {
+							// 处理类型别名：type X = Y 或 type X Y
+							aliasName := x.Name.Name
+							if underlyingType := getTypeAliasUnderlying(x.Type, filePkg); underlyingType != "" {
+								fullAlias := fmt.Sprintf("%s.%s", filePkg, aliasName)
+
+								info := typeAliasPkgInfo{
+									Underlying: underlyingType,
+									PkgName:    filePkg,
+									ImportPath: importPath,
+									FilePath:   fileName,
+								}
+
+								typeAliases[fullAlias] = info
+								typeAliases[aliasName] = info
+
+								if *verbose {
+									log.Printf("    发现类型别名：%s -> %s (包：%s, 导入路径：%s)",
+										fullAlias, underlyingType, filePkg, importPath)
+								}
 							}
 						}
 					}
@@ -523,17 +559,98 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 		}
 	}
 
+	// 处理类型别名：为别名创建指向实际结构体的引用
+	for alias, info := range typeAliases {
+		if targetInfo, ok := structInfos[info.Underlying]; ok {
+			// 为别名创建一个新的 StructInfo 副本，使用别名自己的包信息
+			aliasInfo := &parser2.StructInfo{
+				Name:          alias,
+				Package:       info.PkgName,
+				FilePath:      info.FilePath,
+				ImportPath:    info.ImportPath,
+				Fields:        targetInfo.Fields,
+				EmbeddedTypes: targetInfo.EmbeddedTypes,
+			}
+			structInfos[alias] = aliasInfo
+
+			// 同时注册不带包名的别名（如果别名包含包名）
+			if strings.Contains(alias, ".") {
+				parts := strings.SplitN(alias, ".", 2)
+				shortName := parts[1]
+				structInfos[shortName] = aliasInfo
+			}
+
+			if *verbose {
+				log.Printf("  注册类型别名映射：%s (包：%s, 导入路径：%s) -> %s",
+					alias, info.PkgName, info.ImportPath, info.Underlying)
+			}
+		} else {
+			// 尝试解析带包名的别名
+			parts := strings.Split(alias, ".")
+			if len(parts) == 2 {
+				aliasPkg := parts[0]
+				aliasName := parts[1]
+
+				// 尝试找到实际类型的包名
+				for key, targetInfo := range structInfos {
+					if key == info.Underlying || strings.HasSuffix(key, "."+info.Underlying) {
+						// 创建别名结构体信息，使用别名自己的包信息
+						aliasInfo := &parser2.StructInfo{
+							Name:          aliasName,
+							Package:       aliasPkg,
+							FilePath:      info.FilePath,
+							ImportPath:    info.ImportPath,
+							Fields:        targetInfo.Fields,
+							EmbeddedTypes: targetInfo.EmbeddedTypes,
+						}
+						structInfos[alias] = aliasInfo
+						structInfos[aliasName] = aliasInfo
+
+						if *verbose {
+							log.Printf("  注册类型别名映射：%s (包：%s, 导入路径：%s) -> %s",
+								alias, aliasPkg, info.ImportPath, key)
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
 	return structInfos
 }
 
 // loadDependencyStructs 从依赖包中加载结构体信息
 func loadDependencyStructs(dependencies []string, structInfos map[string]*parser2.StructInfo, fset *token.FileSet, verbose bool) {
 	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedSyntax,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedSyntax | packages.NeedImports,
 		Fset: fset,
 	}
 
+	// 记录已加载的包，避免重复加载
+	loadedPkgs := make(map[string]bool)
+	// 记录包名到导入路径的映射（用于解析类型别名中的包名）
+	pkgNameToImportPath := make(map[string]string)
+
+	// 收集所有类型别名，等所有包加载后再处理
+	allTypeAliases := make(map[string]TypeAliasInfo)
+
+	// 收集需要加载的包列表（包括按需加载的）
+	pkgsToLoad := make([]string, 0, len(dependencies))
 	for _, dep := range dependencies {
+		pkgsToLoad = append(pkgsToLoad, dep)
+	}
+
+	// 循环加载包，直到没有新的包需要加载
+	for i := 0; i < len(pkgsToLoad); i++ {
+		dep := pkgsToLoad[i]
+
+		// 跳过已加载的包
+		if loadedPkgs[dep] {
+			continue
+		}
+		loadedPkgs[dep] = true
+
 		if verbose {
 			log.Printf("加载依赖包：%s", dep)
 		}
@@ -546,8 +663,12 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 
 		for _, pkg := range pkgs {
 			if verbose {
-				log.Printf("  解析包：%s", pkg.PkgPath)
+				log.Printf("  解析包：%s (包名: %s)", pkg.PkgPath, pkg.Name)
 			}
+
+			// 记录包名到导入路径的映射
+			pkgNameToImportPath[pkg.Name] = pkg.PkgPath
+			pkgNameToImportPath[pkg.PkgPath] = pkg.PkgPath // 自身映射
 
 			for _, syntax := range pkg.Syntax {
 				filePkg := pkg.Name
@@ -567,7 +688,9 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 
 							structInfo := parser2.ParseStruct(structName, structType, syntax, structInfos)
 							structInfo.Package = filePkg
-							structInfo.FilePath = pkg.GoFiles[0]
+							if len(pkg.GoFiles) > 0 {
+								structInfo.FilePath = pkg.GoFiles[0]
+							}
 							structInfo.ImportPath = importPath
 
 							for _, key := range keys {
@@ -577,6 +700,57 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 							if verbose {
 								log.Printf("    找到依赖结构体：%s", structName)
 							}
+						} else {
+							// 收集类型别名信息，稍后统一处理
+							aliasName := x.Name.Name
+							if underlyingType := getTypeAliasUnderlying(x.Type, filePkg); underlyingType != "" {
+								fullAlias := fmt.Sprintf("%s.%s", filePkg, aliasName)
+								importPathAlias := fmt.Sprintf("%s.%s", importPath, aliasName)
+
+								goFiles := []string{}
+								if len(pkg.GoFiles) > 0 {
+									goFiles = pkg.GoFiles
+								}
+
+								// 解析底层类型的包名
+								underlyingPkg := ""
+								if strings.Contains(underlyingType, ".") {
+									parts := strings.SplitN(underlyingType, ".", 2)
+									underlyingPkg = parts[0]
+								}
+
+								allTypeAliases[fullAlias] = TypeAliasInfo{
+									AliasName:       aliasName,
+									FullAlias:       fullAlias,
+									ImportPathAlias: importPathAlias,
+									Underlying:      underlyingType,
+									FilePkg:         filePkg,
+									ImportPath:      importPath,
+									GoFiles:         goFiles,
+									UnderlyingPkg:   underlyingPkg, // 新增：记录底层类型的包名
+								}
+
+								// 如果底层类型是外部包，按需加载
+								if underlyingPkg != "" {
+									// 尝试从当前包的导入中查找
+									for _, imp := range pkg.Imports {
+										if imp.Name == underlyingPkg || filepath.Base(imp.PkgPath) == underlyingPkg {
+											pkgNameToImportPath[underlyingPkg] = imp.PkgPath
+											if !loadedPkgs[imp.PkgPath] {
+												pkgsToLoad = append(pkgsToLoad, imp.PkgPath)
+												if verbose {
+													log.Printf("    按需加载依赖包：%s (用于类型 %s)", imp.PkgPath, underlyingType)
+												}
+											}
+											break
+										}
+									}
+								}
+
+								if verbose {
+									log.Printf("    发现依赖包类型别名：%s -> %s", fullAlias, underlyingType)
+								}
+							}
 						}
 					}
 					return true
@@ -584,6 +758,91 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 			}
 		}
 	}
+
+	// 所有包加载完成后，统一处理类型别名
+	if verbose {
+		log.Printf("所有依赖包加载完成，开始处理类型别名...")
+	}
+
+	for _, aliasInfo := range allTypeAliases {
+		underlyingWithPkg := aliasInfo.Underlying
+
+		// 如果底层类型包含包名前缀（如 dto.DictItemResponse）
+		if strings.Contains(aliasInfo.Underlying, ".") {
+			parts := strings.SplitN(aliasInfo.Underlying, ".", 2)
+			underlyingPkgName := parts[0]
+			underlyingTypeName := parts[1]
+
+			// 尝试通过包名找到导入路径
+			if importPath, ok := pkgNameToImportPath[underlyingPkgName]; ok {
+				underlyingWithPkg = fmt.Sprintf("%s.%s", importPath, underlyingTypeName)
+			}
+		} else {
+			// 如果底层类型没有包名前缀，添加当前包名
+			underlyingWithPkg = fmt.Sprintf("%s.%s", aliasInfo.FilePkg, aliasInfo.Underlying)
+		}
+
+		// 尝试多种方式查找底层类型
+		var targetInfo *parser2.StructInfo
+		var found bool
+
+		// 尝试直接查找
+		if info, ok := structInfos[underlyingWithPkg]; ok {
+			targetInfo = info
+			found = true
+		} else {
+			// 尝试其他可能的键
+			for key, info := range structInfos {
+				if key == aliasInfo.Underlying ||
+					strings.HasSuffix(key, "."+aliasInfo.Underlying) ||
+					key == aliasInfo.FilePkg+"."+aliasInfo.Underlying {
+					targetInfo = info
+					found = true
+					break
+				}
+			}
+		}
+
+		// 如果找到了底层类型，创建别名映射
+		if found && targetInfo != nil {
+			filePath := ""
+			if len(aliasInfo.GoFiles) > 0 {
+				filePath = aliasInfo.GoFiles[0]
+			}
+			newAliasInfo := &parser2.StructInfo{
+				Name:          aliasInfo.AliasName,
+				Package:       aliasInfo.FilePkg,
+				FilePath:      filePath,
+				ImportPath:    aliasInfo.ImportPath,
+				Fields:        targetInfo.Fields,
+				EmbeddedTypes: targetInfo.EmbeddedTypes,
+			}
+			structInfos[aliasInfo.FullAlias] = newAliasInfo
+			structInfos[aliasInfo.ImportPathAlias] = newAliasInfo
+			structInfos[aliasInfo.AliasName] = newAliasInfo
+
+			if verbose {
+				log.Printf("    注册依赖包类型别名：%s (包：%s, 导入路径：%s) -> %s",
+					aliasInfo.FullAlias, aliasInfo.FilePkg, aliasInfo.ImportPath, underlyingWithPkg)
+			}
+		} else {
+			if verbose {
+				log.Printf("    警告：无法找到类型别名 %s 的底层类型 %s", aliasInfo.FullAlias, underlyingWithPkg)
+			}
+		}
+	}
+}
+
+// TypeAliasInfo 类型别名信息
+type TypeAliasInfo struct {
+	AliasName       string
+	FullAlias       string
+	ImportPathAlias string
+	Underlying      string
+	FilePkg         string
+	ImportPath      string
+	GoFiles         []string
+	UnderlyingPkg   string // 底层类型的包名（如果有）
 }
 
 // isDependencyStruct 判断是否是依赖包的结构体
@@ -632,6 +891,27 @@ func calculateImportPath(filePath, modulePath, baseDir string) string {
 	}
 
 	return modulePath + "/" + relPath
+}
+
+// getTypeAliasUnderlying 获取类型别名的底层类型名称
+// 支持：
+//   - type X = Y (类型别名)
+//   - type X pkg.Y (外部包类型)
+func getTypeAliasUnderlying(expr ast.Expr, pkgName string) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		// 简单类型别名：type X = Y
+		return t.Name
+	case *ast.SelectorExpr:
+		// 外部包类型：type X = pkg.Y
+		if ident, ok := t.X.(*ast.Ident); ok {
+			return fmt.Sprintf("%s.%s", ident.Name, t.Sel.Name)
+		}
+	case *ast.StarExpr:
+		// 指针类型：type X = *Y
+		return getTypeAliasUnderlying(t.X, pkgName)
+	}
+	return ""
 }
 
 // 查找包含 go.mod 的模块根目录
