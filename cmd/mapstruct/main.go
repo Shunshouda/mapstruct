@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"go/format"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -17,6 +18,7 @@ import (
 )
 
 var (
+	configFile   = flag.String("config", "", "批量模式：从指定 Go 文件读取包级变量 MapstructConfig（通常 -config=generate.go），一次加载全部目录后按组输出")
 	typeNames    = flag.String("type", "", "逗号分隔的类型名称对，格式为:package.Source:package.Dest 或 package.Source:map 或 map:package.Dest")
 	output       = flag.String("output", "", "输出文件名")
 	packageName  = flag.String("package", "", "生成的包名")
@@ -30,6 +32,11 @@ var (
 
 func main() {
 	flag.Parse()
+
+	if *configFile != "" {
+		runBatch(*configFile)
+		return
+	}
 
 	if len(*typeNames) == 0 {
 		flag.Usage()
@@ -78,10 +85,85 @@ func main() {
 		handleStructMapping(gen, pair, structInfos)
 	}
 
-	// 写入文件
+	emit(gen, outputFile)
+}
+
+// runBatch 批量模式：读取配置文件中的 MapstructConfig，一次加载全部
+// Include 目录的并集，再按组生成各自的输出文件。
+func runBatch(configPath string) {
+	groups, err := loadConfigFile(configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *verbose {
+		log.Printf("批量模式：%d 组配置", len(groups))
+	}
+
+	// 所有组的 include 目录取并集，一次 parse
+	dirSet := make(map[string]bool)
+	var scanDirs []string
+	for _, g := range groups {
+		for _, dir := range g.Include {
+			if !dirSet[dir] {
+				dirSet[dir] = true
+				scanDirs = append(scanDirs, dir)
+			}
+		}
+	}
+
+	deps := getDependencies(*dependencies)
+	if *modulePath == "" {
+		*modulePath = detectModulePath()
+	}
+
+	structInfos := collectStructInfos(scanDirs, deps, *modulePath)
+
+	seenOutputs := make(map[string]bool)
+	for i, g := range groups {
+		if seenOutputs[g.Output] {
+			log.Fatalf("配置错误：输出文件 %s 被多组使用", g.Output)
+		}
+		seenOutputs[g.Output] = true
+
+		pkgName := g.Package
+		if pkgName == "" {
+			pkgName = *packageName
+		}
+		if pkgName == "" {
+			pkgName = os.Getenv("GOPACKAGE")
+		}
+		if pkgName == "" {
+			log.Fatalf("第 %d 组（输出 %s）缺少包名：在配置中写 Package 字段，或传 -package，或经 go generate 运行", i+1, g.Output)
+		}
+
+		gen := generator.NewGenerator(pkgName)
+		gen.SetAllStructs(structInfos)
+		gen.SetMapConfig(*mapDirection, *mapValueType)
+
+		for _, pair := range parseTypePairs(strings.Join(g.Types, ",")) {
+			if pair.IsMapConversion {
+				handleMapConversion(gen, pair, structInfos)
+				continue
+			}
+			handleStructMapping(gen, pair, structInfos)
+		}
+
+		emit(gen, g.Output)
+	}
+}
+
+// emit 生成、格式化并写出单个输出文件。
+func emit(gen *generator.Generator, outputFile string) {
 	code, err := gen.Generate()
 	if err != nil {
 		log.Fatal("生成代码失败:", err)
+	}
+
+	// gofmt 格式化（同时稳定 import 顺序）；失败时保留原始输出并告警
+	if formatted, fmtErr := format.Source([]byte(code)); fmtErr == nil {
+		code = string(formatted)
+	} else {
+		log.Printf("警告：生成代码格式化失败，保留原始输出：%v", fmtErr)
 	}
 
 	if err := os.WriteFile(outputFile, []byte(code), 0644); err != nil {
@@ -472,18 +554,17 @@ func collectStructInfos(scanDirs []string, dependencies []string, modulePath str
 						if structType, ok := x.Type.(*ast.StructType); ok {
 							structName := x.Name.Name
 
-							keys := []string{
-								fmt.Sprintf("%s.%s", filePkg, structName),
-								structName,
-							}
-
 							structInfo := parser2.ParseStruct(structName, structType, file, nil)
 							structInfo.Package = filePkg
 							structInfo.FilePath = fileName
 							structInfo.ImportPath = importPath
 
-							for _, key := range keys {
-								structInfos[key] = structInfo
+							// 带包名的 key 直接注册
+							structInfos[fmt.Sprintf("%s.%s", filePkg, structName)] = structInfo
+
+							// 裸名 key 注册时加保护：如果已存在且是不同包，不覆盖
+							if existing, ok := structInfos[structName]; !ok || existing.Package == filePkg {
+								structInfos[structName] = structInfo
 							}
 
 							if *verbose {
@@ -680,12 +761,6 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 						if structType, ok := x.Type.(*ast.StructType); ok {
 							structName := x.Name.Name
 
-							keys := []string{
-								fmt.Sprintf("%s.%s", filePkg, structName),
-								structName,
-								importPath + "." + structName,
-							}
-
 							structInfo := parser2.ParseStruct(structName, structType, syntax, structInfos)
 							structInfo.Package = filePkg
 							if len(pkg.GoFiles) > 0 {
@@ -693,8 +768,13 @@ func loadDependencyStructs(dependencies []string, structInfos map[string]*parser
 							}
 							structInfo.ImportPath = importPath
 
-							for _, key := range keys {
-								structInfos[key] = structInfo
+							// 带包名和导入路径的 key 直接注册
+							structInfos[fmt.Sprintf("%s.%s", filePkg, structName)] = structInfo
+							structInfos[importPath+"."+structName] = structInfo
+
+							// 裸名 key 注册时加保护：如果已存在且是不同包，不覆盖
+							if existing, ok := structInfos[structName]; !ok || existing.Package == filePkg {
+								structInfos[structName] = structInfo
 							}
 
 							if verbose {

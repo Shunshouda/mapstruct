@@ -154,11 +154,49 @@ mapstruct \
   -verbose
 ```
 
+### Batch Mode (recommended)
+
+One `//go:generate` per package spawns one process per directive, and every
+process re-parses the whole include set (typically a large ent package). With
+`-config` the tool reads a typed `MapstructConfig` variable from the same file,
+parses the union of all `Include` dirs once, and writes every group's output —
+byte-identical to the per-directive runs, but N processes become 1.
+
+**generate.go**
+```go
+package converter
+
+// MapstructConfig 字段写错会直接编译失败；值只接受字符串字面量。
+//
+//go:generate mapstruct -config=generate.go
+var MapstructConfig = []struct {
+	Types   []string // "pkg.Source:pkg.Dest" or "...:map[string]any"
+	Include []string // dirs relative to this file
+	Output  string   // output file name
+}{
+	{
+		Types:   []string{"user.User:dto.UserDTO", "req.UserCreateReq:map[string]any"},
+		Include: []string{"./user", "./dto", "./req"},
+		Output:  "user_generated.go",
+	},
+	{
+		Types:   []string{"user.Order:dto.OrderDTO"},
+		Include: []string{"./user", "./dto"},
+		Output:  "order_generated.go",
+	},
+}
+```
+
+`Package` is an optional per-group field; it falls back to `-package`, then to
+the `GOPACKAGE` env var set by `go generate`. Unknown fields are rejected at
+generate time with a file:line position.
+
 ## Command Line Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-type` | Comma-separated type pairs (Source:Dest) | **Required** |
+| `-config` | Batch mode: Go file containing the `MapstructConfig` variable | Empty (single-group mode) |
+| `-type` | Comma-separated type pairs (Source:Dest) | Required unless `-config` |
 | `-include` | Directories to scan for structs | Current directory |
 | `-package` | Package name for generated code | Auto-detected |
 | `-output` | Output file name | `generated_mapstruct.go` |

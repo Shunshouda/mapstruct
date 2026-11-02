@@ -112,7 +112,7 @@ func (s *StructInfo) parseFields(fields *ast.FieldList, file *ast.File, allStruc
 			fieldInfo.JSONName = parseJSONTag(tagValue)
 		}
 
-		s.Fields = append(s.Fields, fieldInfo)
+		s.appendField(fieldInfo)
 	}
 }
 
@@ -145,11 +145,12 @@ func (s *StructInfo) parseEmbeddedField(field *ast.Field, file *ast.File, allStr
 	var embeddedStruct *StructInfo
 
 	// 尝试多种键查找
+	// 带包名的 key 必须优先于裸名 key，防止不同包的同名结构体互相覆盖
 	keys := []string{
-		embeddedTypeName,                   // 完整类型名
-		typeName,                           // 仅类型名
-		pkgName + "." + typeName,           // 包名。类型名
-		s.Package + "." + embeddedTypeName, // 当前包。类型名
+		pkgName + "." + typeName,   // 包名.类型名（最精确，优先匹配）
+		s.Package + "." + typeName, // 当前包.类型名
+		embeddedTypeName,           // 完整类型名
+		typeName,                   // 仅类型名（兜底）
 	}
 
 	for _, key := range keys {
@@ -185,9 +186,18 @@ func (s *StructInfo) parseEmbeddedField(field *ast.Field, file *ast.File, allStr
 				newField.NestedStructInfo = nestedStruct
 			}
 
-			s.Fields = append(s.Fields, newField)
+			s.appendField(newField)
 		}
 	}
+}
+
+// appendField 追加字段并同步失效查找缓存。
+// 解析嵌入字段时的去重会提前触发 GetFieldByName 构建缓存，
+// 若不失效，后续追加的字段（如声明在嵌入字段之后的 ID）将永远查不到。
+func (s *StructInfo) appendField(field FieldInfo) {
+	s.Fields = append(s.Fields, field)
+	s.fieldByNameMap = nil
+	s.fieldByJSONNameMap = nil
 }
 
 // findNestedStruct 查找嵌套的结构体类型
@@ -205,11 +215,12 @@ func (s *StructInfo) findNestedStruct(fieldType string, file *ast.File, allStruc
 	pkgName, bareTypeName := s.parseTypeWithPackage(typeName, file)
 
 	// 尝试多种键查找，包括依赖包的路径
+	// 带包名的 key 必须优先于裸名 key，防止不同包的同名结构体互相覆盖
 	keys := []string{
-		typeName,                     // 完整类型名
-		bareTypeName,                 // 仅类型名
-		pkgName + "." + bareTypeName, // 包名。类型名
-		s.Package + "." + typeName,   // 当前包。类型名
+		pkgName + "." + bareTypeName,   // 包名.类型名（最精确，优先匹配）
+		s.Package + "." + bareTypeName, // 当前包.类型名
+		typeName,                       // 完整类型名
+		bareTypeName,                   // 仅类型名（兜底）
 	}
 
 	// 如果有包名前缀，添加导入路径的键

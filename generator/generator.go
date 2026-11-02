@@ -53,6 +53,8 @@ type Generator struct {
 	UsedPackages      map[string]string             // 包名 -> 导入路径
 	allStructs        map[string]*parser.StructInfo // 所有结构体信息，用于递归生成
 	generatedMappings map[string]bool               // 记录已生成的映射，避免重复
+	methodNames       map[string]string             // 映射键 -> 最终函数名
+	usedMethodNames   map[string]string             // 函数名 -> 映射键(冲突检测)
 	mapDirection      string                        // map 转换方向配置
 	mapValueType      string                        // map 值类型配置
 }
@@ -66,6 +68,8 @@ func NewGenerator(packageName string) *Generator {
 		UsedPackages:      make(map[string]string),
 		allStructs:        make(map[string]*parser.StructInfo),
 		generatedMappings: make(map[string]bool),
+		methodNames:       make(map[string]string),
+		usedMethodNames:   make(map[string]string),
 		mapDirection:      "both",
 		mapValueType:      "any",
 	}
@@ -86,13 +90,48 @@ func (g *Generator) SetMapConfig(direction, valueType string) {
 	}
 }
 
+// resolveMethodName 生成全局唯一的转换函数名。默认 SrcToDst;不同映射对
+// (源/目标包不同但类型同名)撞名时,用目标包名(首字母大写)限定消歧,
+// 如 ShopOpenCloseTimeRangeToInfraShopOpenCloseTimeRange。同一映射键
+// 多次调用返回同一名字(定义处与调用处一致)。
+func (g *Generator) resolveMethodName(source, dest *parser.StructInfo) string {
+	key := fmt.Sprintf("%s.%s->%s.%s",
+		source.Package, source.Name,
+		dest.Package, dest.Name)
+	if name, ok := g.methodNames[key]; ok {
+		return name
+	}
+	name := fmt.Sprintf("%sTo%s", source.Name, dest.Name)
+	if other, taken := g.usedMethodNames[name]; taken && other != key {
+		name = fmt.Sprintf("%sTo%s%s", source.Name, exportPackageName(dest.Package), dest.Name)
+	}
+	if other, taken := g.usedMethodNames[name]; taken && other != key {
+		name = fmt.Sprintf("%s%sTo%s%s",
+			exportPackageName(source.Package), source.Name,
+			exportPackageName(dest.Package), dest.Name)
+	}
+	g.methodNames[key] = name
+	g.usedMethodNames[name] = key
+	return name
+}
+
+// exportPackageName 包名首字母大写(用于函数名限定)。
+func exportPackageName(pkg string) string {
+	if pkg == "" {
+		return ""
+	}
+	r := []rune(pkg)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
+}
+
 // AddMapping 添加结构体映射
 func (g *Generator) AddMapping(source, dest *parser.StructInfo) {
 	mapping := StructMapping{
 		Source:      source,
 		Dest:        dest,
 		FieldMaps:   g.buildFieldMappings(source, dest),
-		MethodName:  fmt.Sprintf("%sTo%s", source.Name, dest.Name),
+		MethodName:  g.resolveMethodName(source, dest),
 		NeedImports: make(map[string]string),
 	}
 
@@ -178,9 +217,18 @@ func (g *Generator) getImportAlias(pkgName, importPath string) string {
 func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldMapping {
 	var mappings []FieldMapping
 
+	// destIgnored dest 字段带 mapstruct:"-"(派生字段由服务层回填)时不参与匹配,
+	// 与 struct↔map 方向的忽略语义保持一致。
+	destIgnored := func(destField *parser.FieldInfo) *parser.FieldInfo {
+		if destField != nil && hasMapStructIgnoreTag(destField.Tag) {
+			return nil
+		}
+		return destField
+	}
+
 	// 1. 首先处理显式标签映射
 	for _, sourceField := range source.Fields {
-		if destField := dest.GetMapStructField(sourceField.Name); destField != nil {
+		if destField := destIgnored(dest.GetMapStructField(sourceField.Name)); destField != nil {
 			mappings = append(mappings, FieldMapping{
 				SourceField: sourceField,
 				DestField:   *destField,
@@ -206,7 +254,7 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 			continue
 		}
 
-		if destField := dest.GetFieldByJSONName(sourceField.JSONName); destField != nil {
+		if destField := destIgnored(dest.GetFieldByJSONName(sourceField.JSONName)); destField != nil {
 			mappings = append(mappings, FieldMapping{
 				SourceField: sourceField,
 				DestField:   *destField,
@@ -228,7 +276,7 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 			continue
 		}
 
-		if destField := dest.GetFieldByName(sourceField.Name); destField != nil {
+		if destField := destIgnored(dest.GetFieldByName(sourceField.Name)); destField != nil {
 			mappings = append(mappings, FieldMapping{
 				SourceField: sourceField,
 				DestField:   *destField,
@@ -242,6 +290,29 @@ func (g *Generator) buildFieldMappings(source, dest *parser.StructInfo) []FieldM
 
 // Generate 生成代码
 func (g *Generator) Generate() (string, error) {
+	// 先生成全部函数体：generateNestedMappings 会随着深入注册新的依赖包，
+	// 必须在输出 import 块之前完成，否则会漏 import
+	var body strings.Builder
+
+	// 生成结构体映射函数
+	for _, mapping := range g.StructMappings {
+		body.WriteString(g.generateMappingFunction(mapping))
+		body.WriteString("\n\n")
+	}
+
+	// 生成嵌套对象映射函数
+	g.generateNestedMappings(&body)
+
+	// 生成 map 映射函数
+	for _, mapping := range g.MapMappings {
+		if mapping.Direction == "to-map" {
+			body.WriteString(g.generateStructToMapFunction(mapping))
+		} else {
+			body.WriteString(g.generateMapToStructFunction(mapping))
+		}
+		body.WriteString("\n\n")
+	}
+
 	var builder strings.Builder
 
 	// 文件头
@@ -276,24 +347,8 @@ func (g *Generator) Generate() (string, error) {
 		builder.WriteString(")\n\n")
 	}
 
-	// 生成结构体映射函数
-	for _, mapping := range g.StructMappings {
-		builder.WriteString(g.generateMappingFunction(mapping))
-		builder.WriteString("\n\n")
-	}
-
-	// 生成嵌套对象映射函数
-	g.generateNestedMappings(&builder)
-
-	// 生成 map 映射函数
-	for _, mapping := range g.MapMappings {
-		if mapping.Direction == "to-map" {
-			builder.WriteString(g.generateStructToMapFunction(mapping))
-		} else {
-			builder.WriteString(g.generateMapToStructFunction(mapping))
-		}
-		builder.WriteString("\n\n")
-	}
+	// 函数体
+	builder.WriteString(body.String())
 
 	return builder.String(), nil
 }
@@ -309,7 +364,11 @@ func (g *Generator) generateNestedMappings(builder *strings.Builder) {
 		g.collectNestedMappings(mapping.Source, mapping.Dest, &toGenerate)
 	}
 
-	for _, pair := range toGenerate {
+	// 用下标遍历而不是 range：collectNestedMappings 会在遍历过程中向 toGenerate
+	// 追加更深层嵌套的映射对（range 在开始时求值一次，追加的项不会被访问）
+	for i := 0; i < len(toGenerate); i++ {
+		pair := toGenerate[i]
+
 		mappingKey := fmt.Sprintf("%s.%s->%s.%s",
 			pair.source.Package, pair.source.Name,
 			pair.dest.Package, pair.dest.Name)
@@ -322,7 +381,7 @@ func (g *Generator) generateNestedMappings(builder *strings.Builder) {
 			Source:      pair.source,
 			Dest:        pair.dest,
 			FieldMaps:   g.buildFieldMappings(pair.source, pair.dest),
-			MethodName:  fmt.Sprintf("%sTo%s", pair.source.Name, pair.dest.Name),
+			MethodName:  g.resolveMethodName(pair.source, pair.dest),
 			NeedImports: make(map[string]string),
 		}
 
@@ -344,6 +403,32 @@ func (g *Generator) generateNestedMappings(builder *strings.Builder) {
 		g.generatedMappings[mappingKey] = true
 		g.collectNestedMappings(pair.source, pair.dest, &toGenerate)
 	}
+}
+
+// resolveNested 按包名.类型名重新解析嵌套结构体的最新定义。
+// 解析器的两轮细化会替换 allStructs 中的条目，字段上缓存的 NestedStructInfo
+// 可能是细化前的旧快照（其嵌套字段未解析），重新查一次拿到最终版本
+func (g *Generator) resolveNested(info *parser.StructInfo) *parser.StructInfo {
+	if info == nil {
+		return nil
+	}
+
+	keys := make([]string, 0, 3)
+	if info.Package != "" {
+		keys = append(keys, info.Package+"."+info.Name)
+	}
+	if info.ImportPath != "" {
+		keys = append(keys, info.ImportPath+"."+info.Name)
+	}
+	keys = append(keys, info.Name)
+
+	for _, key := range keys {
+		if st, ok := g.allStructs[key]; ok {
+			return st
+		}
+	}
+
+	return info
 }
 
 // collectNestedMappings 收集嵌套对象的映射对
@@ -375,8 +460,8 @@ func (g *Generator) collectNestedMappings(source, dest *parser.StructInfo, toGen
 			continue
 		}
 
-		nestedSource := sourceField.NestedStructInfo
-		nestedDest := destField.NestedStructInfo
+		nestedSource := g.resolveNested(sourceField.NestedStructInfo)
+		nestedDest := g.resolveNested(destField.NestedStructInfo)
 
 		if nestedSource != nil && nestedDest != nil {
 			mappingKey := fmt.Sprintf("%s.%s->%s.%s",
@@ -456,9 +541,14 @@ func (g *Generator) generateStructToMapFunction(mapping MapMapping) string {
 		if mapKey == "" {
 			continue
 		}
-		fieldAccess := g.getFieldAccess(field)
-		valueExpr := g.generateMapValueExpr(field, "src."+fieldAccess)
-		builder.WriteString(fmt.Sprintf("\tresult[\"%s\"] = %s\n", mapKey, valueExpr))
+		fieldRef := "src." + g.getFieldAccess(field)
+		// 指针字段：nil 表示"未提供"，key 不写入 map。ent 的 SetField 不接受 nil，
+		// 显式清空须由调用方走 ClearField 通道，故仅拷贝非空值。
+		if strings.HasPrefix(field.Type, "*") {
+			builder.WriteString(fmt.Sprintf("\tif %s != nil {\n\t\tresult[\"%s\"] = *%s\n\t}\n", fieldRef, mapKey, fieldRef))
+			continue
+		}
+		builder.WriteString(fmt.Sprintf("\tresult[\"%s\"] = %s\n", mapKey, fieldRef))
 	}
 
 	builder.WriteString("\treturn result\n")
@@ -565,20 +655,6 @@ func (g *Generator) getFieldAccess(field parser.FieldInfo) string {
 	return field.Name
 }
 
-// generateMapValueExpr 生成 map 值表达式
-func (g *Generator) generateMapValueExpr(field parser.FieldInfo, fieldRef string) string {
-	fieldType := field.Type
-
-	// 指针类型处理
-	if strings.HasPrefix(fieldType, "*") {
-		baseType := strings.TrimPrefix(fieldType, "*")
-		return fmt.Sprintf("func() %s { if %s != nil { return *%s }; return %s }()", g.mapValueType, fieldRef, fieldRef, g.getZeroValue(baseType))
-	}
-
-	// 基本类型直接返回
-	return fieldRef
-}
-
 // generateMapToFieldAssignment 生成从 map 到字段的赋值代码
 func (g *Generator) generateMapToFieldAssignment(field parser.FieldInfo, mapKey string) string {
 	var builder strings.Builder
@@ -634,22 +710,6 @@ func (g *Generator) generateMapToFieldAssignment(field parser.FieldInfo, mapKey 
 	builder.WriteString("\t}\n")
 
 	return builder.String()
-}
-
-// getZeroValue 获取类型的零值
-func (g *Generator) getZeroValue(typeName string) string {
-	switch typeName {
-	case "int", "int8", "int16", "int32", "int64":
-		return "0"
-	case "float32", "float64":
-		return "0"
-	case "bool":
-		return "false"
-	case "string":
-		return "\"\""
-	default:
-		return "nil"
-	}
 }
 
 // getTypeConversion 获取类型转换函数
@@ -712,9 +772,17 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 
 	// 如果是嵌套对象，生成递归调用
 	if fieldMap.SourceField.IsNestedObject && fieldMap.DestField.IsNestedObject {
-		methodName := fmt.Sprintf("%sTo%s",
-			fieldMap.SourceField.NestedStructInfo.Name,
-			fieldMap.DestField.NestedStructInfo.Name)
+		// 与 collectNestedMappings 注册的定义名保持同源(resolveNested 取
+		// 两轮细化后的最终定义,resolveMethodName 保证定义/调用一致)。
+		methodName := g.resolveMethodName(
+			g.resolveNested(fieldMap.SourceField.NestedStructInfo),
+			g.resolveNested(fieldMap.DestField.NestedStructInfo))
+
+		// 切片类型的嵌套对象：逐元素生成转换循环
+		if isSliceType(sourceType) && isSliceType(destType) {
+			return g.generateSliceNestedAssignment(destFieldRef, sourceFieldRef,
+				sourceType, destType, methodName, fieldMap)
+		}
 
 		if strings.HasPrefix(sourceType, "*") && strings.HasPrefix(destType, "*") {
 			return fmt.Sprintf("%s = %s(%s)", destFieldRef, methodName, sourceFieldRef)
@@ -781,6 +849,65 @@ func (g *Generator) generateFieldAssignment(mapping StructMapping, fieldMap Fiel
 		sourceType, destType)
 }
 
+// isSliceType 判断是否是切片类型
+func isSliceType(t string) bool {
+	return strings.HasPrefix(t, "[]")
+}
+
+// sliceElemIsPointer 判断切片元素是否为指针类型
+func sliceElemIsPointer(sliceType string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(sliceType, "[]"), "*")
+}
+
+// generateSliceNestedAssignment 生成切片嵌套对象的逐元素转换代码，
+// 覆盖源/目标元素指针形态的四种组合（nil 切片保持 nil）
+func (g *Generator) generateSliceNestedAssignment(destFieldRef, sourceFieldRef,
+	sourceType, destType, methodName string, fieldMap FieldMapping) string {
+
+	srcElemPtr := sliceElemIsPointer(sourceType)
+	dstElemPtr := sliceElemIsPointer(destType)
+
+	destSliceType := "[]"
+	if dstElemPtr {
+		destSliceType += "*"
+	}
+	destSliceType += g.getQualifiedType(fieldMap.DestField.NestedStructInfo)
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("if %s != nil {\n", sourceFieldRef))
+	b.WriteString(fmt.Sprintf("\t\t%s = make(%s, len(%s))\n", destFieldRef, destSliceType, sourceFieldRef))
+
+	switch {
+	case srcElemPtr && dstElemPtr:
+		// []*T -> []*T，nil 元素经转换函数的 nil 保护后仍为 nil
+		b.WriteString(fmt.Sprintf("\t\tfor i, item := range %s {\n", sourceFieldRef))
+		b.WriteString(fmt.Sprintf("\t\t\t%s[i] = %s(item)\n", destFieldRef, methodName))
+		b.WriteString("\t\t}\n")
+	case srcElemPtr && !dstElemPtr:
+		// []*T -> []T，跳过 nil 元素
+		b.WriteString(fmt.Sprintf("\t\tfor i, item := range %s {\n", sourceFieldRef))
+		b.WriteString("\t\t\tif item != nil {\n")
+		b.WriteString(fmt.Sprintf("\t\t\t\tif tmp := %s(item); tmp != nil {\n", methodName))
+		b.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = *tmp\n", destFieldRef))
+		b.WriteString("\t\t\t\t}\n")
+		b.WriteString("\t\t\t}\n")
+		b.WriteString("\t\t}\n")
+	case !srcElemPtr && dstElemPtr:
+		// []T -> []*T
+		b.WriteString(fmt.Sprintf("\t\tfor i := range %s {\n", sourceFieldRef))
+		b.WriteString(fmt.Sprintf("\t\t\t%s[i] = %s(&%s[i])\n", destFieldRef, methodName, sourceFieldRef))
+		b.WriteString("\t\t}\n")
+	default:
+		// []T -> []T
+		b.WriteString(fmt.Sprintf("\t\tfor i := range %s {\n", sourceFieldRef))
+		b.WriteString(fmt.Sprintf("\t\t\t%s[i] = *%s(&%s[i])\n", destFieldRef, methodName, sourceFieldRef))
+		b.WriteString("\t\t}\n")
+	}
+
+	b.WriteString("\t}")
+	return b.String()
+}
+
 // isConvertibleType 检查是否可转换的基本类型
 func (g *Generator) isConvertibleType(sourceType, destType string) bool {
 	convertiblePairs := map[string][]string{
@@ -816,11 +943,21 @@ func (g *Generator) isSameTypeDifferentPackage(sourceType, destType string, mapp
 	return sourceTypeName == destTypeName && sourceTypeName != ""
 }
 
-// getTypeNameWithoutPackage 获取不包含包名的类型名
+// getTypeNameWithoutPackage 去掉命名类型的包限定符，保留指针和切片形状。
+// []infra.Source 与 []Source 是同一切片；Source、*Source、[]Source彼此不同。
 func (g *Generator) getTypeNameWithoutPackage(typeName string) string {
-	parts := strings.Split(typeName, ".")
-	if len(parts) > 1 {
-		return parts[1]
+	prefix := ""
+	for {
+		switch {
+		case strings.HasPrefix(typeName, "*"):
+			prefix += "*"
+			typeName = strings.TrimPrefix(typeName, "*")
+		case strings.HasPrefix(typeName, "[]"):
+			prefix += "[]"
+			typeName = strings.TrimPrefix(typeName, "[]")
+		default:
+			parts := strings.Split(typeName, ".")
+			return prefix + parts[len(parts)-1]
+		}
 	}
-	return parts[0]
 }
